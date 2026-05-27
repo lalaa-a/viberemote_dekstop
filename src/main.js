@@ -19,11 +19,21 @@ const ALLOW_ALL_FILE  = 'C:\\temp\\relay-allow-all.txt';
 
 // Built at runtime so the hook command always uses the current absolute path
 function buildHookBlock() {
-  const hookCmd = `node "${path.join(RELAY_ROOT, 'hook-wrapper.cjs')}"`;
+  const wrap = (name) => `node "${path.join(RELAY_ROOT, name)}"`;
   return {
     PreToolUse: [{
-      matcher: 'Bash|Write|Edit|MultiEdit',
-      hooks: [{ type: 'command', command: hookCmd }],
+      matcher: 'Bash|Write|Edit|MultiEdit|Read',
+      hooks: [{ type: 'command', command: wrap('hook-wrapper.cjs') }],
+    }],
+    PostToolUse: [{
+      matcher: 'Bash|Write|Edit|MultiEdit|Read',
+      hooks: [{ type: 'command', command: wrap('postHook-wrapper.cjs') }],
+    }],
+    Notification: [{
+      hooks: [{ type: 'command', command: wrap('notifyHook-wrapper.cjs') }],
+    }],
+    Stop: [{
+      hooks: [{ type: 'command', command: wrap('stopHook-wrapper.cjs') }],
     }],
   };
 }
@@ -52,7 +62,7 @@ function writeSettings(obj) {
 // The hook is the sole gatekeeper — it exits 0 (allow) or 2 (deny).
 // Without this, Claude Code's own "Allow? [y/n]" prompt appears alongside the
 // hook and keeps waiting for keyboard input even after mobile approves.
-const HOOK_TOOLS_ALLOW = ['Bash(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)'];
+const HOOK_TOOLS_ALLOW = ['Bash(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)', 'Read(*)'];
 
 function applyMobilePermissions(settings) {
   if (!settings.permissions)       settings.permissions = {};
