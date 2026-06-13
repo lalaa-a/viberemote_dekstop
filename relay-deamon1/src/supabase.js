@@ -1,0 +1,145 @@
+import { createClient } from '@supabase/supabase-js'
+import { config }        from './config.js'
+
+// Anon client — used only for Realtime subscriptions (read-only)
+export const supabase = createClient(config.supabaseUrl, config.supabaseKey, {
+  auth:     { persistSession: false },
+  realtime: { params: { eventsPerSecond: 10 } },
+})
+
+// ── VPS API helpers ───────────────────────────────────────────────────────────
+// All writes go through the VPS backend. The service key never lives on this machine.
+
+async function apiPost(path, body) {
+  const res = await fetch(`${config.apiUrl}${path}`, {
+    method:  'POST',
+    headers: {
+      'Content-Type':       'application/json',
+      'x-machine-api-key':  config.machineApiKey,
+    },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.status)
+    throw new Error(`VPS ${path} failed: ${text}`)
+  }
+  return res.json()
+}
+
+async function apiGet(path) {
+  const res = await fetch(`${config.apiUrl}${path}`, {
+    headers: { 'x-machine-api-key': config.machineApiKey },
+  })
+  if (!res.ok) return null
+  return res.json()
+}
+
+// ── Upsert agent/session row ──────────────────────────────────────────────────
+export async function agentPing(sessionId, cwd, toolName) {
+  return apiPost('/relay/agent-ping', { sessionId, cwd, toolName })
+}
+
+// ── Fetch next pending mobile command (idle-gated on server) ─────────────────
+export async function getNextCommand() {
+  return apiGet('/mobile/command/next')
+}
+
+// ── File tree ─────────────────────────────────────────────────────────────────
+export async function getPendingFsRequest() {
+  return apiGet('/machines/fs/pending')
+}
+
+export async function respondFsRequest(requestId, treeOrError) {
+  return apiPost('/machines/fs/respond', { requestId, ...treeOrError })
+}
+
+// ── Upload a pending request row ──────────────────────────────────────────────
+export async function uploadRequest(row) {
+  return apiPost('/relay/upload', { payload: row })
+}
+
+// ── Mark a request decided — used when PC terminal responds first ─────────────
+export async function markDecided(requestId, status, decidedBy = null) {
+  return apiPost('/relay/decide', { requestId, decision: status })
+}
+
+// ── Update machine heartbeat ──────────────────────────────────────────────────
+export async function heartbeat() {
+  return apiPost('/machines/heartbeat', {})
+}
+
+// ── Report which session CLIs are still alive on this machine ─────────────────
+export async function reportSessionsAlive(aliveSessionIds) {
+  return apiPost('/relay/sessions-alive', { aliveSessionIds })
+}
+
+// ── Mark machine offline (called on clean shutdown) ───────────────────────────
+export async function markOffline() {
+  return apiPost('/machines/offline', {})
+}
+
+// ── Post a terminal lifecycle event (tool_start/tool_end/notification/stop) ──
+export async function postTerminalEvent({ session_id, event_type, tool_name, summary, detail, status }) {
+  return apiPost('/relay/terminal-event', { session_id, event_type, tool_name, summary, detail, status })
+}
+
+// ── Block until someone approves / denies, or timeout ────────────────────────
+// Returns { decision: 'approved'|'denied'|'timeout', decidedBy: 'pc'|'mobile'|null }
+//
+// Realtime is the fast path. Polling runs in parallel as a guaranteed fallback
+// because Supabase Realtime can silently drop events (RLS on anon key, replication
+// not enabled on the table, transient WebSocket issues) without ever emitting
+// CHANNEL_ERROR — meaning the old "poll only on error" approach never triggered.
+export function waitForDecision(requestId) {
+  return new Promise((resolve) => {
+    let settled    = false
+    let pollInterval = null
+
+    function finish(decision, decidedBy = null) {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      clearInterval(pollInterval)
+      try { channel.unsubscribe() } catch {}
+      resolve({ decision, decidedBy })
+    }
+
+    const timer = setTimeout(() => finish('timeout', null), config.timeoutMs)
+
+    // Realtime — fast path, fires immediately when the event is delivered
+    const channel = supabase
+      .channel('decision:' + requestId)
+      .on(
+        'postgres_changes',
+        {
+          event:  'UPDATE',
+          schema: 'public',
+          table:  'pending_requests',
+          filter: `id=eq.${requestId}`,
+        },
+        (payload) => {
+          const status    = payload.new?.status
+          const decidedBy = payload.new?.decided_by || 'mobile'
+          if (status === 'approved' || status === 'denied') {
+            finish(status, decidedBy)
+          }
+        },
+      )
+      .subscribe()
+
+    // Polling — always runs as safety net every 3s regardless of Realtime health
+    pollInterval = setInterval(async () => {
+      try {
+        const res = await fetch(
+          `${config.apiUrl}/relay/status/${requestId}`,
+          { headers: { 'x-machine-api-key': config.machineApiKey } }
+        )
+        if (!res.ok) return
+        const data = await res.json()
+        if (data?.status === 'approved' || data?.status === 'denied') {
+          finish(data.status, data.decided_by || 'mobile')
+        }
+      } catch {}
+    }, 3000)
+  })
+}
