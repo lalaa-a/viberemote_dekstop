@@ -127,7 +127,10 @@ export function waitForDecision(requestId) {
       )
       .subscribe()
 
-    // Polling — always runs as safety net every 3s regardless of Realtime health
+    // Polling — reconnect backstop only. Realtime above is the primary path and
+    // lands the decision in <1s on a healthy socket; this 25s poll just covers a
+    // silently-dropped WebSocket. (Was 3s — that hammered the API for no benefit
+    // while Realtime was working.)
     pollInterval = setInterval(async () => {
       try {
         const res = await fetch(
@@ -140,6 +143,71 @@ export function waitForDecision(requestId) {
           finish(data.status, data.decided_by || 'mobile')
         }
       } catch {}
-    }, 3000)
+    }, 25_000)
+  })
+}
+
+// ── Block until the user picks an option for a question request, or timeout ───
+// Sibling to waitForDecision, for kind='question' rows. Resolves when the row's
+// status flips to 'answered' (carrying selected_options), or when the PC terminal
+// drops a local signal file (relay.cjs answer <n>). Returns:
+//   { selected_options: [...] }  — the picked option(s)
+//   { timeout: true }            — no answer within config.timeoutMs
+import { existsSync, mkdirSync, readFileSync, unlinkSync } from 'fs'
+import { join }                                            from 'path'
+
+const QUESTION_PENDING_DIR = 'C:\\temp\\relay-pending'
+
+export function waitForAnswer(requestId) {
+  return new Promise((resolve) => {
+    let settled = false, pollInterval = null, filePoll = null
+    const answerFile = join(QUESTION_PENDING_DIR, `${requestId}.answer.json`)
+
+    function finish(payload) {
+      if (settled) return
+      settled = true
+      clearTimeout(timer); clearInterval(pollInterval); clearInterval(filePoll)
+      try { channel.unsubscribe() } catch {}
+      try { unlinkSync(answerFile) } catch {}
+      resolve(payload)
+    }
+
+    const timer = setTimeout(() => finish({ timeout: true }), config.timeoutMs)
+
+    // Realtime — fast path: the row flips to status='answered'.
+    const channel = supabase
+      .channel('decision:' + requestId)
+      .on('postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'pending_requests', filter: `id=eq.${requestId}` },
+        (payload) => {
+          if (payload.new?.status === 'answered') {
+            finish({ selected_options: payload.new.selected_options })
+          }
+        })
+      .subscribe()
+
+    // Backstop poll — covers a silently-dropped WebSocket. /relay/status now
+    // returns selected_options (server migration 011 + route change).
+    pollInterval = setInterval(async () => {
+      try {
+        const res = await fetch(`${config.apiUrl}/relay/status/${requestId}`,
+          { headers: { 'x-machine-api-key': config.machineApiKey } })
+        if (!res.ok) return
+        const data = await res.json()
+        if (data?.status === 'answered') finish({ selected_options: data.selected_options })
+      } catch {}
+    }, 25_000)
+
+    // Local terminal fallback — relay.cjs writes {id}.answer.json (selected_options).
+    try {
+      mkdirSync(QUESTION_PENDING_DIR, { recursive: true })
+      filePoll = setInterval(() => {
+        try {
+          if (!existsSync(answerFile)) return
+          const parsed = JSON.parse(readFileSync(answerFile, 'utf8'))
+          finish({ selected_options: parsed.selected_options ?? parsed })
+        } catch {}
+      }, 150)
+    } catch {}
   })
 }

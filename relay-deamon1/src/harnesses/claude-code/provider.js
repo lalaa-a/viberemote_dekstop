@@ -28,7 +28,7 @@ const wrap = (name) => `node "${path.join(RELAY_ROOT, name)}"`
 function buildHookBlock() {
   return {
     PreToolUse: [{
-      matcher: 'Bash|Write|Edit|MultiEdit|Read',
+      matcher: 'Bash|Write|Edit|MultiEdit|Read|AskUserQuestion',
       hooks: [{ type: 'command', command: wrap('hook-wrapper.cjs') }],
     }],
     PostToolUse: [{

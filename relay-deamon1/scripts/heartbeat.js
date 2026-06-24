@@ -14,7 +14,7 @@ import { spawn }                  from 'child_process'
 import fs                         from 'fs'
 import path                       from 'path'
 import os                         from 'os'
-import { heartbeat, markOffline, getNextCommand, getPendingFsRequest, respondFsRequest, postTerminalEvent, reportSessionsAlive } from '../src/supabase.js'
+import { supabase, heartbeat, markOffline, getNextCommand, getPendingFsRequest, respondFsRequest, postTerminalEvent, reportSessionsAlive } from '../src/supabase.js'
 import { config }                 from '../src/config.js'
 import { logger }                 from '../src/logger.js'
 
@@ -549,6 +549,35 @@ async function reportSessionLiveness() {
   }
 }
 
+// ── Realtime nudge for prompt delivery ───────────────────────────────────────
+// Instead of polling /mobile/command/next on a tight timer, subscribe to INSERTs
+// on mobile_commands for THIS machine and run checkPendingCommands on each nudge.
+// The HTTP call (and its server-side idle-gating + atomic "mark delivered") stays
+// — we just stop the steady polling. A slow interval below remains as a backstop
+// in case the socket drops. mobile_commands is in the Realtime publication
+// (server migration 005).
+function subscribeCommandNudge() {
+  try {
+    supabase
+      .channel(`mcmd:${config.machineId}`)
+      .on('postgres_changes', {
+        event:  'INSERT',
+        schema: 'public',
+        table:  'mobile_commands',
+        filter: `machine_id=eq.${config.machineId}`,
+      }, () => {
+        fileLog('command nudge received — claiming pending command')
+        checkPendingCommands()
+      })
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') fileLog('command nudge subscribed')
+      })
+  } catch (err) {
+    fileLog(`command nudge subscribe failed: ${err.message}`)
+    logger.warn('command nudge subscribe failed', { err: err.message })
+  }
+}
+
 // ── Shutdown ──────────────────────────────────────────────────────────────────
 
 async function shutdown() {
@@ -567,8 +596,10 @@ logger.info('Heartbeat started', { machine: config.machineId })
 syncOpencodePluginEnv()   // sync immediately on launch
 tick()
 reportSessionLiveness()
+subscribeCommandNudge()   // Realtime push for prompt delivery (primary path)
+checkPendingCommands()    // drain anything already queued at startup
 setInterval(tick,                  30_000)
-setInterval(checkPendingCommands,  10_000)
+setInterval(checkPendingCommands,  30_000)   // backstop only — nudge is primary
 setInterval(checkFsRequests,        5_000)
 setInterval(checkTranscripts,       3_000)
 setInterval(reportSessionLiveness, 15_000)

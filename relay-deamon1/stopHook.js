@@ -49,10 +49,12 @@ async function main() {
     status:     'success',
   }).catch(() => {})
 
-  // Session ended — drop the transcript mapping so heartbeat stops tailing it
-  if (event.session_id) {
-    try { unlinkSync(join(TRANSCRIPT_DIR, `${event.session_id}.path`)) } catch {}
-  }
+  // Do NOT delete the transcript mapping here. Stop fires at the end of EVERY turn
+  // (not when the CLI closes), so deleting it removed the mapping the heartbeat's 3s
+  // transcript tailer needs — short turns deleted their mapping before the tailer
+  // read the new reasoning, so narrative never reached mobile. Aging of genuinely
+  // dead sessions is handled by the heartbeat's 5-min STALE_MAPPING_MS gate; a
+  // closed CLI is tracked separately via the relay-pid liveness probe.
 
   process.exit(0)
 }

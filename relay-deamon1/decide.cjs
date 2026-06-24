@@ -10,7 +10,7 @@
  *
  * This writes a local signal file (picked up by the hook in ~150 ms) AND
  * updates Supabase so the mobile app sees the decision immediately.
- */
+*/
 
 const { createClient } = require('@supabase/supabase-js')
 const path = require('path')

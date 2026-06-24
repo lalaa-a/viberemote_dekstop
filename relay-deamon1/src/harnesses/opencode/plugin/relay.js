@@ -64,6 +64,42 @@ async function uploadAndWait(e, row) {
   return e.failOpen !== false   // honor the machine's fail-open/closed policy
 }
 
+// Upload a kind='question' request and block until the mobile user picks an option.
+// Mirrors uploadAndWait but resolves on status='answered' and returns the chosen
+// selected_options (or null on timeout). Reuses the exact same harness-agnostic
+// /relay/upload + /relay/status pipeline the Claude Code question flow already uses.
+async function uploadAndWaitAnswer(e, row) {
+  const res = await fetch(`${e.apiUrl}/relay/upload`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-machine-api-key': e.machineApiKey },
+    body: JSON.stringify({ payload: row }),
+  })
+  if (!res.ok) throw new Error(`upload failed ${res.status}`)
+  const { id } = await res.json()
+
+  const deadline = Date.now() + (e.timeoutMs || 300000)
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 1500))
+    const s = await fetch(`${e.apiUrl}/relay/status/${id}`, {
+      headers: { 'x-machine-api-key': e.machineApiKey },
+    }).then((r) => (r.ok ? r.json() : null)).catch(() => null)
+    if (s?.status === 'answered') return s.selected_options || []
+  }
+  return null   // no answer within the timeout
+}
+
+// Turn the structured selection into a natural-language string the model reads as
+// the tool's result (the OpenCode analogue of Claude's block-reason answer).
+function formatAnswer(questions, selected_options) {
+  const parts = (selected_options || []).map((ans) => {
+    const q = questions[ans.question_index] ?? questions[0]
+    const labels = (ans.selected || []).map((s) => `"${s.label}"`).join(', ')
+    const custom = ans.custom_text ? ` (custom answer: "${ans.custom_text}")` : ''
+    return `Q: "${q?.question}" → The user selected: ${labels || ans.custom_text}${custom}.`
+  })
+  return `[Answered remotely via mobile] ${parts.join(' ')} Proceed with this choice.`
+}
+
 const GATED = new Set(['bash', 'edit', 'write', 'patch'])
 
 // Track which sessions we've already pinged so we only do it once per session
@@ -137,7 +173,105 @@ const _postedParts = new Set()
 
 export const VibeRelay = async ({ project, directory } = {}) => {
   dbg(`plugin loaded — flag=${fs.existsSync(FLAG_FILE)} dir=${directory ?? '?'}`)
+
+  // ── Custom "ask the user a choice" tool — the mobile question picker for OpenCode.
+  // OpenCode has no built-in AskUserQuestion tool, so we register one here. Unlike the
+  // Claude Code hook (which can only block with exit 2), an OpenCode tool returns its
+  // result directly — so the user's chosen option(s) become the tool output the model
+  // reads, with no "hook error" noise. Loaded via dynamic import so that a resolution
+  // failure can NEVER break the rest of the plugin (gating + narrative keep working).
+  let askTool = null
+  try {
+    const { tool } = await import('@opencode-ai/plugin/tool')
+    const z = tool.schema
+    askTool = tool({
+      description:
+        'Ask the user a multiple-choice question and wait for their selection. Use this ' +
+        'whenever you need the user to choose between options or make a decision, instead of ' +
+        'only asking in plain text — it lets a remote user pick an option from their phone.',
+      args: {
+        questions: z.array(z.object({
+          header:      z.string().optional(),
+          question:    z.string(),
+          multiSelect: z.boolean().optional(),
+          options:     z.array(z.object({
+            label:       z.string(),
+            description: z.string().optional(),
+          })),
+        })),
+      },
+      execute: async (args, context) => {
+        dbg(`askUserQuestion.execute CALLED — ${(args?.questions ?? []).length} question(s)`)
+        const e = env()
+        const questions = args?.questions ?? []
+        if (!fs.existsSync(FLAG_FILE) || !e.apiUrl || questions.length === 0) {
+          return 'Mobile picker unavailable — ask the user this question directly in your reply and wait for their answer.'
+        }
+        recordPid(context.sessionID)
+        agentPing(e, context.sessionID, context.directory ?? directory ?? null)
+
+        const summary = questions[0].header
+          ? `${questions[0].header}: ${questions[0].question}`
+          : questions[0].question
+
+        postTerminalEvent(e, {
+          session_id: context.sessionID ?? null,
+          event_type: 'tool_start',
+          tool_name:  'askUserQuestion',
+          summary,
+        })
+
+        const row = {
+          id: randomUUID(),
+          harness: 'opencode',
+          kind: 'question',
+          user_id: e.userId, machine_id: e.machineId,
+          session_id: context.sessionID ?? null,
+          tool_name: 'askUserQuestion',
+          display_type: 'question',
+          summary,
+          risk_level: 'low', risk_reason: 'OpenCode is asking you to choose', risk_icon: '❓',
+          files_affected: [],
+          question: { questions },
+          status: 'pending', created_at: new Date().toISOString(),
+        }
+
+        let selected
+        try {
+          selected = await uploadAndWaitAnswer(e, row)
+        } catch (err) {
+          dbg(`question upload failed: ${err.message}`)
+          return 'Could not reach the mobile app — ask the user directly in your reply instead.'
+        }
+        if (!selected) return 'No answer from the user within the time limit. Ask again or proceed conservatively.'
+        dbg(`question answered: ${JSON.stringify(selected)}`)
+        return formatAnswer(questions, selected)
+      },
+    })
+  } catch (err) {
+    dbg(`ask tool unavailable (import failed): ${err.message}`)
+  }
+  dbg(`askUserQuestion tool ${askTool ? 'registered OK' : 'NOT registered'}`)
+
   return {
+    // ── Custom tool registration (only added if the import above succeeded) ────
+    ...(askTool ? { tool: { askUserQuestion: askTool } } : {}),
+
+    // Nudge the model to use askUserQuestion when mobile mode is on, so a remote
+    // user gets a tappable picker instead of a plain-text question they must type.
+    'experimental.chat.system.transform': async (_input, output) => {
+      if (!fs.existsSync(FLAG_FILE) || !askTool) { dbg('system.transform skipped (flag/askTool)'); return }
+      try {
+        output.system.push(
+          'IMPORTANT: When you need the user to choose between options, decide between ' +
+          'alternatives, or answer a question that has a fixed set of possible answers, you MUST ' +
+          'call the `askUserQuestion` tool with the question(s) and their options — do NOT ask ' +
+          'multiple-choice questions in plain prose. A remote user picks an option from their phone.'
+        )
+        dbg('system.transform nudge added')
+      } catch (err) { dbg(`system.transform error: ${err.message}`) }
+    },
+
     // ── 0. Cleanup on OpenCode shutdown ───────────────────────────────────────
     // Removes this session's PID file so the heartbeat treats the CLI as closed
     // and resumes future prompts in a new window rather than a dead terminal.

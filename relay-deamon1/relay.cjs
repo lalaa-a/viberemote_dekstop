@@ -27,7 +27,7 @@ const SETTINGS_FILE = path.join(
 // The hook block injected when switching to mobile mode
 const HOOK_BLOCK = {
   PreToolUse: [{
-    matcher: 'Bash|Write|Edit|MultiEdit|Read',
+    matcher: 'Bash|Write|Edit|MultiEdit|Read|AskUserQuestion',
     hooks: [{ type: 'command', command: `node "${path.join(__dirname, 'hook-wrapper.cjs')}"` }],
   }],
   PostToolUse: [{
@@ -182,6 +182,72 @@ if (cmd === 'reset') {
   try { fs.unlinkSync(ALLOW_ALL_FILE) } catch {}
   console.log('Allow-all cleared — approval prompts will show again')
   process.exit(0)
+}
+
+// ── answer <n> — pick option n for a pending AskUserQuestion (1-based) ─────────
+// Mirrors the approve/deny local-signal path: writes {id}.answer.json which the
+// hook's waitForAnswer() file-poll picks up in ~150ms, AND posts to the server so
+// the mobile feed reflects the answer. Single-question, single-select for the CLI.
+if (cmd === 'answer') {
+  const pick = parseInt(process.argv[3], 10)
+  if (!pick || Number.isNaN(pick) || pick < 1) {
+    console.error('Usage:  ! node relay.cjs answer <n>   (n = option number, 1-based)')
+    process.exit(1)
+  }
+
+  const QFILE = path.join(TEMP_DIR, 'relay-current-question.json')
+  let q
+  try { q = JSON.parse(fs.readFileSync(QFILE, 'utf8')) } catch {
+    console.error('No pending question found.')
+    process.exit(1)
+  }
+
+  const requestId = q.requestId || readCurrentId()
+  const question  = q.questions?.[0]
+  const option    = question?.options?.[pick - 1]
+  if (!requestId || !option) {
+    console.error(`Option ${pick} not found (question has ${question?.options?.length ?? 0} options).`)
+    process.exit(1)
+  }
+
+  const answers = [{
+    question_index: 0,
+    selected: [{ index: pick - 1, label: option.label }],
+  }]
+
+  // Local signal — unblocks the hook immediately.
+  try {
+    fs.mkdirSync(PENDING_DIR, { recursive: true })
+    fs.writeFileSync(
+      path.join(PENDING_DIR, `${requestId}.answer.json`),
+      JSON.stringify({ selected_options: answers }),
+      'utf8',
+    )
+  } catch (e) {
+    console.error('Failed to write answer signal:', e.message)
+    process.exit(1)
+  }
+
+  // Also tell the server so mobile sees the answer.
+  ;(async () => {
+    try {
+      const res = await fetch(`${process.env.API_URL}/relay/answer`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'x-machine-api-key': process.env.MACHINE_API_KEY },
+        body:    JSON.stringify({ requestId, answers }),
+      })
+      if (!res.ok) {
+        const text = await res.text().catch(() => res.status)
+        console.log(`✅ Answered "${option.label}"  (hook signaled; API: ${text})`)
+      } else {
+        console.log(`✅ Answered "${option.label}"`)
+      }
+    } catch (err) {
+      console.log(`✅ Answered "${option.label}"  (hook signaled; API unreachable: ${err.message})`)
+    }
+    process.exit(0)
+  })()
+  return
 }
 
 // ── approve / deny (only meaningful in mobile mode) ───────────────────────────

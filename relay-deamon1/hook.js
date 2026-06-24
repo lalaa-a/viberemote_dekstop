@@ -23,8 +23,8 @@ import { dirname }                                           from 'path'
 import { config }                                            from './src/config.js'
 import { parseEvent }                                        from './src/parsers.js'
 import { preFilter }                                         from './src/filter.js'
-import { uploadRequest, waitForDecision, markDecided,
-         agentPing, postTerminalEvent }                       from './src/supabase.js'
+import { uploadRequest, waitForDecision, waitForAnswer, markDecided,
+         agentPing, postTerminalEvent }                      from './src/supabase.js'
 import { logger }                                            from './src/logger.js'
 
 const __dir     = dirname(fileURLToPath(import.meta.url))
@@ -172,6 +172,104 @@ function raceDecision(requestId) {
   })
 }
 
+async function handleQuestion(event){
+  const questions = event.tool_input?.questions
+  if(!Array.isArray(questions)||questions.length === 0) {
+    //Nothing to ask - let claude's native tool to handle it.
+    process.exit(0);return
+  }
+
+  //Keep the session row fresh (same as the approval path).
+  try {
+    await agentPing(event.session_id, event.cwd ?? process.cwd(),'AskUserQuestion')
+  } catch {}
+
+  const requestId = randomUUID()
+  try {
+    mkdirSync('C:\\temp', { recursive: true })
+    writeFileSync(CURRENT_FILE, requestId, 'utf8') //lets relay.cjs answer by index
+    // Persist the options so `relay.cjs answer <n>` can map an index → label locally.
+    writeFileSync(
+      join('C:\\temp', 'relay-current-question.json'),
+      JSON.stringify({ requestId, questions }),
+      'utf8',
+    )
+  } catch {}
+
+  const row = {
+    id:             requestId, 
+    user_id:        config.userId, 
+    machine_id:     config.machineId,
+    session_id:     event.session_id     || null,
+    harness:        'claude-code',
+    kind:           'question',
+    tool_name:      'AskUserQuestion',
+    display_type:   'question',
+    summary:        questions[0].header ? `${questions[0].header} : ${questions[0].question}` 
+                    : questions[0].question,
+    risk_level:     'low',
+    risk_reason:    'Claude is asking you to choose an option',
+    risk_icon:      '❓',
+    files_affected: [],
+    question:       { questions }, // ← full structured payload
+    status:         'pending', 
+    created_at:     new Date().toISOString(),
+  }
+
+  try {
+    await uploadRequest(row)
+  } catch (err) {
+    debugLog(`question upload failed: ${err.message}`)
+    // Can't reach the server — fall back to the native picker so the user isn't stuck.
+    process.exit(0);return
+  }
+
+  // Mirror the approval path's "tool_start" so mobile shows activity immediately.
+  postTerminalEvent({
+    session_id: event.session_id, event_type: 'tool_start',
+    tool_name: 'AskUserQuestion', summary: row.summary, detail: null, status: null,
+  }).catch(() => {})
+
+  process.stderr.write(
+    `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `  RELAY  ❓ Claude is asking a question\n` +
+    `  ${row.summary}\n` +
+    `  → Sent to mobile app. Or answer from terminal:\n` +
+    `      ! node ${relayPath} answer 1   (pick option 1)\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`
+  )
+
+  // Block until the user answers (mobile) or the terminal supplies an index.
+  let answer
+  try {
+    answer = await waitForAnswer(requestId)   // { selected_options } | { timeout:true }
+  } catch (err) {
+    debugLog(`waitForAnswer error: ${err.message}`)
+    process.exit(config.failOpen ? 0 : 2); return
+  }
+
+  if (answer?.timeout) {
+    // No answer in time → let the native picker take over rather than guess.
+    hardExit(2, 'No answer within the time limit — please answer in the terminal.')
+    return
+  }
+
+  // Turn the structured selection into a natural-language block reason Claude can act on.
+  hardExit(2, formatAnswerReason(questions, answer.selected_options))
+}
+
+// Build the deny reason that carries the chosen option(s) back to the model.
+function formatAnswerReason(questions, selected_options) {
+  const parts = (selected_options || []).map(ans => {
+    const q = questions[ans.question_index] ?? questions[0]
+    const labels = (ans.selected || []).map(s => `"${s.label}"`).join(', ')
+    const custom = ans.custom_text ? ` (custom answer: "${ans.custom_text}")` : ''
+    return `Q: "${q.question}" → The user selected: ${labels || ans.custom_text}${custom}.`
+  })
+  return `[Answered remotely via mobile] ${parts.join(' ')} ` +
+         `Proceed with this choice and do NOT call AskUserQuestion again for this question.`
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
   debugLog('hook started')
@@ -193,10 +291,18 @@ async function main() {
 
   // Cache the real claude PID so the heartbeat can inject mobile prompts into
   // this exact terminal. Runs the expensive process-tree walk only once per session.
+  // MUST run before the AskUserQuestion branch below: if a session's first hook fire
+  // is a question, returning early here would skip PID registration entirely and the
+  // heartbeat would report the CLI as closed even though it's still open.
   storeClaudePid(event.session_id)
 
   // Record the transcript path so heartbeat can tail it for narrative output
   recordTranscriptPath(event.session_id, event.transcript_path)
+
+  if(event.tool_name === "AskUserQuestion") {
+    await handleQuestion(event)
+    return
+  }
 
   // Pre-filter
   const { action: filterAction, reason: filterReason } = preFilter(event.tool_name, event.tool_input || {})
