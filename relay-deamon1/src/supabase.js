@@ -40,8 +40,12 @@ export async function agentPing(sessionId, cwd, toolName) {
 }
 
 // ── Fetch next pending mobile command (idle-gated on server) ─────────────────
-export async function getNextCommand() {
-  return apiGet('/mobile/command/next')
+// Pass a sessionId to scope the claim to that session — the desktop does this when it
+// knows that CLI is idle. command/next atomically marks the row delivered, so we must
+// only claim what we can inject right now. See FAST_PROMPT_DELIVERY_DESIGN.md.
+export async function getNextCommand(sessionId) {
+  const qs = sessionId ? `?session=${encodeURIComponent(sessionId)}` : ''
+  return apiGet(`/mobile/command/next${qs}`)
 }
 
 // ── File tree ─────────────────────────────────────────────────────────────────

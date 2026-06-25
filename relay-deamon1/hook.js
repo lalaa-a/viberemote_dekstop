@@ -299,6 +299,12 @@ async function main() {
   // Record the transcript path so heartbeat can tail it for narrative output
   recordTranscriptPath(event.session_id, event.transcript_path)
 
+  // Mark this session busy (a turn is in flight) so the heartbeat won't inject a queued
+  // mobile prompt mid-turn. The Stop hook clears it. See FAST_PROMPT_DELIVERY_DESIGN.md.
+  if (event.session_id) {
+    try { writeFileSync(`C:\\temp\\relay-busy-${event.session_id}.flag`, String(Date.now())) } catch {}
+  }
+
   if(event.tool_name === "AskUserQuestion") {
     await handleQuestion(event)
     return

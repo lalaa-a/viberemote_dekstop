@@ -27,6 +27,32 @@ function fileLog(msg) {
   } catch {}
 }
 
+// ── Per-session busy/idle tracking for fast prompt delivery ───────────────────
+// command/next atomically marks a command delivered, so we must only claim when the
+// target CLI is at its prompt (idle). "Busy" is a flag file written while a turn is in
+// flight: the Claude hook writes it on each tool call and the heartbeat writes it on
+// inject; the Stop hook deletes it and drops a relay-ready flag (turn ended). OpenCode
+// does the same from its plugin (tool.execute.before / session.idle).
+//
+// TTL is deliberately short (60s): if an injected prompt silently fails to start a turn
+// (e.g. the inject pasted into the wrong terminal window) no Stop ever fires to clear the
+// flag, so a long TTL would lock the session out of every further prompt. The Claude hook
+// and OpenCode plugin re-write this flag on every tool call, so a genuinely active turn
+// stays "busy" regardless of the TTL; only a stuck/failed inject ages out — within 60s
+// instead of minutes. See FAST_PROMPT_DELIVERY_DESIGN.md.
+const BUSY_TTL_MS = 60 * 1000
+function busyFlag(sessionId)  { return `C:\\temp\\relay-busy-${sessionId}.flag` }
+function isBusy(sessionId) {
+  if (!sessionId) return false
+  try {
+    const st = fs.statSync(busyFlag(sessionId))
+    if (Date.now() - st.mtimeMs > BUSY_TTL_MS) { try { fs.unlinkSync(busyFlag(sessionId)) } catch {}; return false }
+    return true
+  } catch { return false }
+}
+function markBusy(sessionId)  { if (sessionId) { try { fs.writeFileSync(busyFlag(sessionId), String(Date.now())) } catch {} } }
+function clearBusy(sessionId) { if (sessionId) { try { fs.unlinkSync(busyFlag(sessionId)) } catch {} } }
+
 // ── Machine heartbeat (30s) ───────────────────────────────────────────────────
 
 async function tick() {
@@ -97,33 +123,41 @@ function isSessionProcessAlive(sessionId) {
   } catch { return false }
 }
 
-async function checkPendingCommands() {
+// ── Prompt delivery — claim + inject into the existing CLI ────────────────────
+// Called on a broadcast nudge (sessionId scoped), on a turn-end ready flag, and on a
+// slow backstop (no session → server applies its legacy idle gate). We only CLAIM a
+// command for a session we believe is idle, because the server marks it delivered the
+// moment it hands it over — claiming for a busy session would lose the prompt.
+async function drainQueue(sessionId) {
   try {
-    const cmd = await getNextCommand()
+    // Never claim for a session we know is mid-turn — wait for its Stop/turn-end flag.
+    if (sessionId && isBusy(sessionId)) return
+
+    const cmd = await getNextCommand(sessionId)
     if (!cmd?.prompt) return
 
     const harness = cmd.harness || 'claude-code'
-    fileLog(`prompt received — sessionId=${cmd.sessionId} harness=${harness}`)
+    fileLog(`prompt claimed — sessionId=${cmd.sessionId} harness=${harness}`)
     logger.info('Delivering prompt', { sessionId: cmd.sessionId, harness })
 
-    // ── CLI still open → inject into that exact terminal ──────────────────────
+    // ── CLI still open → inject into that exact terminal (UNCHANGED injector) ──
     // Only Claude/OpenCode run an injectable interactive console (Gemini uses the
     // PTY-proxy model). We require the PID to be alive so we never inject into a
-    // closed/stale terminal — and we NEVER spawn a new window for a closed CLI
-    // (resuming one unattended is dangerous; the mobile app blocks that case).
+    // closed/stale terminal — and we NEVER spawn a new window for a closed CLI.
     const injectable = harness === 'claude-code' || harness === 'opencode'
 
-    if (injectable && isSessionProcessAlive(cmd.sessionId)) {
+    if (injectable && isSessionProcessAlive(cmd.sessionId) && !isBusy(cmd.sessionId)) {
+      markBusy(cmd.sessionId)   // hold further prompts for this session until its Stop
       const injected = await tryInjectIntoExistingTerminal(cmd.sessionId, cmd.prompt)
       if (injected) {
         fileLog(`prompt injected into existing ${harness} terminal`)
         return
       }
+      clearBusy(cmd.sessionId)
       fileLog(`live PID but injection failed for ${harness} — dropping prompt`)
     } else {
-      // CLI was closed (or non-injectable). Drop the prompt and tell the user via
-      // a notification event instead of silently launching a new agent.
-      fileLog(`CLI closed for session ${cmd.sessionId} (${harness}) — prompt not delivered`)
+      // CLI was closed/busy (or non-injectable). Notify instead of silently relaunching.
+      fileLog(`CLI closed/busy for session ${cmd.sessionId} (${harness}) — prompt not delivered`)
     }
 
     postTerminalEvent({
@@ -135,8 +169,8 @@ async function checkPendingCommands() {
       status:     null,
     }).catch(() => {})
   } catch (err) {
-    fileLog(`checkPendingCommands error: ${err.message}`)
-    logger.warn('checkPendingCommands failed', { err: err.message })
+    fileLog(`drainQueue error: ${err.message}`)
+    logger.warn('drainQueue failed', { err: err.message })
   }
 }
 
@@ -225,6 +259,8 @@ public class Inj {
     [DllImport("kernel32.dll")] public static extern bool FreeConsole();
     [DllImport("kernel32.dll",SetLastError=true)] public static extern bool AttachConsole(uint pid);
     [DllImport("kernel32.dll",SetLastError=true)] public static extern IntPtr GetStdHandle(int h);
+    [DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)] public static extern IntPtr CreateFileW(string n, uint a, uint s, IntPtr sec, uint d, uint f, IntPtr t);
+    [DllImport("kernel32.dll",SetLastError=true)] public static extern bool CloseHandle(IntPtr h);
     [DllImport("kernel32.dll",SetLastError=true)] public static extern bool WriteConsoleInput(IntPtr h, IR[] b, uint n, out uint w);
     [DllImport("user32.dll")] public static extern short VkKeyScan(char c);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
@@ -234,7 +270,13 @@ public class Inj {
     public static int Write(uint pid, string text) {
         FreeConsole();
         if (!AttachConsole(pid)) return 1000 + Marshal.GetLastWin32Error();
-        IntPtr h = GetStdHandle(-10);
+        // Open the real console input buffer. GetStdHandle(STD_INPUT) returns a redirected
+        // handle on ConPTY / Windows Terminal, so WriteConsoleInput then fails with
+        // ERROR_INVALID_HANDLE (6) and we fall back to the fragile clipboard paste. CONIN$ is
+        // the documented way to get a writable input handle for the attached console; we keep
+        // GetStdHandle as a fallback so this can only improve, never regress.
+        IntPtr h = CreateFileW("CONIN$", 0x80000000u | 0x40000000u, 0x1u | 0x2u, IntPtr.Zero, 3u, 0u, IntPtr.Zero);
+        if (h == IntPtr.Zero || h == new IntPtr(-1)) h = GetStdHandle(-10);
         if (h == IntPtr.Zero || h == new IntPtr(-1)) { FreeConsole(); return 2000; }
         var list = new List<IR>();
         foreach (char c in text) {
@@ -250,6 +292,7 @@ public class Inj {
         uint written;
         bool ok = WriteConsoleInput(h, arr, (uint)arr.Length, out written);
         int err = Marshal.GetLastWin32Error();
+        CloseHandle(h);
         FreeConsole();
         if (!ok) return 3000 + err;
         return (int)written;
@@ -559,23 +602,69 @@ async function reportSessionLiveness() {
 function subscribeCommandNudge() {
   try {
     supabase
-      .channel(`mcmd:${config.machineId}`)
+      .channel(`machine:${config.machineId}`)
+      // PRIMARY: broadcast is reliable where postgres_changes is silently dropped on
+      // this self-hosted Supabase. The server fires it from POST /mobile/prompt with the
+      // sessionId so we can do a scoped, idle-gated claim. See FAST_PROMPT_DELIVERY_DESIGN.md.
+      .on('broadcast', { event: 'command_available' }, ({ payload }) => {
+        fileLog(`command_available broadcast — draining session=${payload?.sessionId ?? '(any)'}`)
+        drainQueue(payload?.sessionId || undefined)
+      })
+      // SECONDARY: harmless if it also fires (claim is atomic/idempotent).
       .on('postgres_changes', {
         event:  'INSERT',
         schema: 'public',
         table:  'mobile_commands',
         filter: `machine_id=eq.${config.machineId}`,
-      }, () => {
-        fileLog('command nudge received — claiming pending command')
-        checkPendingCommands()
+      }, (p) => {
+        fileLog('mobile_commands INSERT — draining')
+        drainQueue(p?.new?.session_id || undefined)
       })
       .subscribe((status) => {
-        if (status === 'SUBSCRIBED') fileLog('command nudge subscribed')
+        if (status === 'SUBSCRIBED') fileLog('command nudge subscribed (broadcast + pg)')
       })
   } catch (err) {
     fileLog(`command nudge subscribe failed: ${err.message}`)
     logger.warn('command nudge subscribe failed', { err: err.message })
   }
+}
+
+// ── Turn-end watcher (1s) ─────────────────────────────────────────────────────
+// The Stop hook (Claude) and the OpenCode plugin (session.idle) drop a relay-ready flag
+// when a turn ends. Consume it and immediately drain any prompt queued for that now-idle
+// session, so a prompt sent mid-turn lands within ~1s of the turn finishing.
+function checkReadyFlags() {
+  let files
+  try { files = fs.readdirSync('C:\\temp') } catch { return }
+  for (const f of files) {
+    const m = /^relay-ready-(.+)\.flag$/.exec(f)
+    if (!m) continue
+    try { fs.unlinkSync(path.join('C:\\temp', f)) } catch {}
+    const sid = m[1]
+    clearBusy(sid)
+    fileLog(`turn-end ready flag for ${sid} — draining`)
+    drainQueue(sid)
+  }
+}
+
+// ── Delivery backstop (3s) ────────────────────────────────────────────────────
+// Covers a missed broadcast. Iterate the live sessions (those with a relay-pid file)
+// and drain only the IDLE ones — every claim is therefore session-scoped and pre-gated
+// by isBusy, so we never claim a command we can't inject (which would lose it, since the
+// server marks it delivered on claim). Only when there are no live sessions do we fall
+// back to an unscoped claim (for the rare session-less prompt).
+function drainBackstop() {
+  let files
+  try { files = fs.readdirSync('C:\\temp') } catch { files = [] }
+  let anyLive = false
+  for (const f of files) {
+    const m = /^relay-pid-(.+)\.txt$/.exec(f)
+    if (!m) continue
+    anyLive = true
+    const sid = m[1]
+    if (!isBusy(sid)) drainQueue(sid)
+  }
+  if (!anyLive) drainQueue()   // session-less fallback (server applies its legacy gate)
 }
 
 // ── Shutdown ──────────────────────────────────────────────────────────────────
@@ -596,10 +685,11 @@ logger.info('Heartbeat started', { machine: config.machineId })
 syncOpencodePluginEnv()   // sync immediately on launch
 tick()
 reportSessionLiveness()
-subscribeCommandNudge()   // Realtime push for prompt delivery (primary path)
-checkPendingCommands()    // drain anything already queued at startup
+subscribeCommandNudge()   // broadcast push for prompt delivery (primary path)
+drainBackstop()           // drain anything already queued at startup (scoped per live session)
 setInterval(tick,                  30_000)
-setInterval(checkPendingCommands,  30_000)   // backstop only — nudge is primary
+setInterval(drainBackstop,          3_000)   // backstop only — broadcast + ready-flag are primary
+setInterval(checkReadyFlags,        1_000)   // inject queued prompts the instant a turn ends
 setInterval(checkFsRequests,        5_000)
 setInterval(checkTranscripts,       3_000)
 setInterval(reportSessionLiveness, 15_000)

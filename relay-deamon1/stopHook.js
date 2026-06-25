@@ -56,6 +56,13 @@ async function main() {
   // dead sessions is handled by the heartbeat's 5-min STALE_MAPPING_MS gate; a
   // closed CLI is tracked separately via the relay-pid liveness probe.
 
+  // Turn ended → clear the busy flag and drop a ready flag so the heartbeat injects any
+  // prompt queued for this now-idle session within ~1s. See FAST_PROMPT_DELIVERY_DESIGN.md.
+  if (event.session_id) {
+    try { unlinkSync(`C:\\temp\\relay-busy-${event.session_id}.flag`) } catch {}
+    try { writeFileSync(`C:\\temp\\relay-ready-${event.session_id}.flag`, '1') } catch {}
+  }
+
   process.exit(0)
 }
 

@@ -152,6 +152,21 @@ function clearPids() {
   dbg(`cleared ${_pidWritten.size} pid file(s) on dispose`)
 }
 
+// ── Busy/idle flags for fast prompt delivery (mirrors the Claude hook scheme) ──
+// While a turn is in flight we write relay-busy-<sessionId>.flag so the heartbeat won't
+// inject a queued prompt mid-turn; on session.idle we delete it and drop a relay-ready
+// flag so the heartbeat injects within ~1s. See FAST_PROMPT_DELIVERY_DESIGN.md.
+function markBusyOC(sessionId) {
+  if (!sessionId || process.platform !== 'win32') return
+  try { fs.writeFileSync(path.join(PID_DIR, `relay-busy-${sessionId}.flag`), String(Date.now())) } catch {}
+}
+function readyOC(sessionId) {
+  if (!sessionId || process.platform !== 'win32') { dbg(`readyOC skipped — sid=${sessionId}`); return }
+  try { fs.unlinkSync(path.join(PID_DIR, `relay-busy-${sessionId}.flag`)) } catch {}
+  try { fs.writeFileSync(path.join(PID_DIR, `relay-ready-${sessionId}.flag`), '1') } catch {}
+  dbg(`session.idle → cleared busy + ready flag for ${sessionId}`)
+}
+
 // ── Shared terminal-event helper ──────────────────────────────────────────────
 async function postTerminalEvent(e, payload) {
   if (!e.apiUrl) { dbg('postTerminalEvent skipped — no apiUrl'); return }
@@ -186,9 +201,11 @@ export const VibeRelay = async ({ project, directory } = {}) => {
     const z = tool.schema
     askTool = tool({
       description:
-        'Ask the user a multiple-choice question and wait for their selection. Use this ' +
-        'whenever you need the user to choose between options or make a decision, instead of ' +
-        'only asking in plain text — it lets a remote user pick an option from their phone.',
+        'Ask the remote user a question and wait for their answer. This is the ONLY way to get ' +
+        'input from the user: they are on a phone and CANNOT see or reply to anything you write as ' +
+        'plain text. Use it for EVERY question — choosing between options, yes/no confirmations, or ' +
+        'open-ended input. Provide the question plus a list of options the user can tap (for a ' +
+        'yes/no, pass options "Yes" and "No"; for open input, the user can type a custom answer).',
       args: {
         questions: z.array(z.object({
           header:      z.string().optional(),
@@ -263,10 +280,13 @@ export const VibeRelay = async ({ project, directory } = {}) => {
       if (!fs.existsSync(FLAG_FILE) || !askTool) { dbg('system.transform skipped (flag/askTool)'); return }
       try {
         output.system.push(
-          'IMPORTANT: When you need the user to choose between options, decide between ' +
-          'alternatives, or answer a question that has a fixed set of possible answers, you MUST ' +
-          'call the `askUserQuestion` tool with the question(s) and their options — do NOT ask ' +
-          'multiple-choice questions in plain prose. A remote user picks an option from their phone.'
+          'CRITICAL — HOW TO ASK THE USER ANYTHING: The user is REMOTE, on a phone, and CANNOT ' +
+          'read or answer questions you type as plain text. A prose question will go unanswered ' +
+          'forever and you will stall. The ONLY way to ask the user a question is to call the ' +
+          '`askUserQuestion` tool. This applies to EVERY question without exception — multiple ' +
+          'choice, yes/no confirmations, and open-ended prompts. Never put a question to the user ' +
+          'in prose or wait for a typed reply; always call `askUserQuestion` with the question and ' +
+          'its options (use "Yes"/"No" for confirmations).'
         )
         dbg('system.transform nudge added')
       } catch (err) { dbg(`system.transform error: ${err.message}`) }
@@ -280,6 +300,7 @@ export const VibeRelay = async ({ project, directory } = {}) => {
     // ── 1. Tool gating ────────────────────────────────────────────────────────
     'tool.execute.before': async (input, output) => {
       if (!fs.existsSync(FLAG_FILE)) return
+      markBusyOC(input.sessionID)            // any tool call → a turn is in flight
       if (!GATED.has(input.tool)) return
 
       const e = env()
@@ -338,11 +359,23 @@ export const VibeRelay = async ({ project, directory } = {}) => {
     // so each reasoning/response block becomes one chat bubble.
     event: async ({ event }) => {
       if (!fs.existsSync(FLAG_FILE)) return
+
+      // Turn ended → clear busy + drop a ready flag so the heartbeat injects any queued
+      // prompt for this now-idle session within ~1s. See FAST_PROMPT_DELIVERY_DESIGN.md.
+      if (event?.type === 'session.idle') {
+        const p = event.properties || {}
+        const sid = p.sessionID || p.info?.id || p.session?.id || p.sessionId
+        dbg(`session.idle received — sid=${sid ?? '(none)'} keys=${Object.keys(p).join(',')}`)
+        readyOC(sid)
+        return
+      }
+
       if (!event || event.type !== 'message.part.updated') return
 
       const part = event.properties?.part
       if (!part) return
       if (part.type !== 'text' && part.type !== 'reasoning') return
+      markBusyOC(part.sessionID)                        // output is streaming → a turn is in flight
       if (part.synthetic) return                       // skip auto-generated parts
 
       // Only emit once the streaming part has completed.
