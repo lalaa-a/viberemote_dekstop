@@ -7,6 +7,7 @@ module.exports = {
   packagerConfig: {
     name: 'VibeRemote',
     executableName: 'VibeRemote',
+    icon: path.join(__dirname, 'src/assets/logo/vibeRemote_icon.ico'),
     asar: true,
     // relay-deamon1 must be outside asar so Node can exec its scripts.
     // We mirror the Vite plugin's default ignore (only keep .vite/) and also
@@ -80,7 +81,7 @@ module.exports = {
       config: {
         name: 'VibeRemote',
         setupExe: 'VibeRemoteSetup.exe',
-        setupIcon: undefined,
+        setupIcon: path.join(__dirname, 'src/assets/logo/vibeRemote_icon.ico'),
       },
     },
     {

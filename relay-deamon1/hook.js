@@ -254,8 +254,9 @@ async function handleQuestion(event){
     return
   }
 
-  // Turn the structured selection into a natural-language block reason Claude can act on.
-  hardExit(2, formatAnswerReason(questions, answer.selected_options))
+  // Turn the structured selection into a natural-language reason Claude can act on, and
+  // deliver it via a clean deny (exit 0) so there's no "hook error" banner.
+  answerExit(formatAnswerReason(questions, answer.selected_options))
 }
 
 // Build the deny reason that carries the chosen option(s) back to the model.
@@ -439,6 +440,21 @@ async function main() {
 function hardExit(code, reason) {
   if (code !== 0 && reason) process.stderr.write(JSON.stringify({ decision: reason }) + '\n')
   process.exit(code)
+}
+
+// Clean "answer the question" exit for AskUserQuestion. Instead of exit 2 (which Claude
+// Code renders as a "hook error" banner), we exit 0 and DENY the tool via the official
+// PreToolUse JSON contract — the native picker never renders and the model reads the
+// answer from permissionDecisionReason. See CLAUDE_ASKUSERQUESTION_MECHANISM.md §3.3.
+function answerExit(reason) {
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName:            'PreToolUse',
+      permissionDecision:       'deny',
+      permissionDecisionReason: reason,
+    },
+  }) + '\n')
+  process.exit(0)
 }
 
 main().catch(err => {

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY, API_URL } from '../lib/supabase.js';
+import vibeRemoteLogo from '../assets/logo/vibeRemote_logo.svg';
 
 async function sha256hex(text) {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
@@ -11,6 +12,33 @@ async function sha256hex(text) {
 // user login on the desktop anymore (mobile-first auth). Identity arrives by pairing.
 function machineHeaders(apiKey) {
   return { 'Content-Type': 'application/json', 'x-machine-api-key': apiKey };
+}
+
+function LogoMark() {
+  return <img src={vibeRemoteLogo} width="26" height="26" alt="" />;
+}
+
+// Per-harness glyph, drawn dark on the green bubble.
+function HarnessGlyph({ harness }) {
+  const p = { width: 20, height: 20, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' };
+  if (harness === 'claude-code') return (
+    <svg {...p}>
+      <rect x="4" y="7" width="16" height="11" rx="3" />
+      <path d="M12 4v3" />
+      <circle cx="9.5" cy="12.5" r="1.1" fill="currentColor" stroke="none" />
+      <circle cx="14.5" cy="12.5" r="1.1" fill="currentColor" stroke="none" />
+    </svg>
+  );
+  if (harness === 'opencode') return (
+    <svg {...p}>
+      <rect x="5" y="5" width="14" height="14" rx="3" />
+      <rect x="9.5" y="9.5" width="5" height="5" rx="1" fill="currentColor" stroke="none" />
+    </svg>
+  );
+  if (harness === 'gemini-cli') return (
+    <svg {...p}><path d="M9 7l5 5-5 5" /></svg>
+  );
+  return <svg {...p}><circle cx="12" cy="12" r="6" /></svg>;
 }
 
 export default function Dashboard() {
@@ -235,51 +263,51 @@ export default function Dashboard() {
     );
   }
 
-  const header = (
-    <header className="dash-header">
-      <div className="header-logo">
-        <span className="logo-icon">⬡</span>
-        <span className="logo-text">Vibe Remote</span>
-      </div>
-    </header>
-  );
+  const installed = harnesses.filter(h => h.installed);
 
   return (
     <div className="dashboard">
-      {header}
+      <header className="dash-header">
+        <div className="header-logo">
+          <span className="logo-mark"><LogoMark /></span>
+          <span className="logo-text">vibeRemote</span>
+        </div>
+      </header>
 
       <main className="dash-main">
         {error && <div className="banner-error">{error}</div>}
 
+        {/* ── Machine ── */}
         <section className="card">
-          <h2 className="card-title">Machine ID</h2>
-          <p className="card-sub">Unique identifier for this machine in the system.</p>
-          <div className="id-row">
-            <code className="machine-id">{machineConfig?.machineId || '—'}</code>
-            <button className="btn-copy" onClick={copyMachineId}>
-              {copied ? 'Copied!' : 'Copy'}
-            </button>
+          <h2 className="card-title">Machine</h2>
+          <div className="kv-row">
+            <span className="kv-key">Label</span>
+            <span className="kv-val">{machineConfig?.machineLabel || '—'}</span>
           </div>
-          {machineConfig?.machineLabel && (
-            <p className="machine-label-text">Label: {machineConfig.machineLabel}</p>
-          )}
+          <div className="kv-row">
+            <span className="kv-key">Machine ID</span>
+            <span className="kv-val mono">
+              <span className="mono-text">{machineConfig?.machineId || '—'}</span>
+              <button className="btn-copy-sm" onClick={copyMachineId}>{copied ? '✓' : 'Copy'}</button>
+            </span>
+          </div>
         </section>
 
+        {/* ── Mobile Connection ── */}
         <section className="card">
           <h2 className="card-title">Mobile Connection</h2>
-          {pairing === null && (
-            <p className="card-sub">Loading pairing state…</p>
-          )}
+          {pairing === null && <p className="card-sub">Loading pairing state…</p>}
+
           {pairing && !pairing.paired && (
             <>
               {pairing._error && (
-                <p className="card-sub" style={{ color: '#d9534f' }}>Pairing check failed — {pairing._error}</p>
+                <p className="card-sub" style={{ color: 'var(--error)' }}>Pairing check failed — {pairing._error}</p>
               )}
-              <p className="card-sub">Scan this QR code with the Vibe Remote mobile app to connect your phone.</p>
+              <p className="card-sub">Scan this QR code with the Vibe Remote app to connect your phone.</p>
               <div className="qr-wrap">
                 {qrData ? (
                   <div className="qr-box">
-                    <QRCodeSVG value={qrData} size={180} bgColor="#ffffff" fgColor="#0a0b10" level="M" />
+                    <QRCodeSVG value={qrData} size={150} bgColor="#ffffff" fgColor="#082134" level="M" />
                   </div>
                 ) : (
                   <div className="qr-placeholder">Preparing QR…</div>
@@ -287,6 +315,7 @@ export default function Dashboard() {
               </div>
             </>
           )}
+
           {pairing && pairing.paired && (
             <div className="paired-device">
               <div className="paired-info">
@@ -294,43 +323,36 @@ export default function Dashboard() {
                 <div>
                   <p className="paired-name">{pairing.device?.device_name ?? 'Phone'}</p>
                   <p className="paired-meta">
-                    {pairing.device?.platform ?? 'android'}
-                    {pairing.paired_at ? ' · Connected ' + new Date(pairing.paired_at).toLocaleDateString() : ''}
+                    <span className="status-dot on" style={{ display: 'inline-block', marginRight: 6 }} />
+                    Connected
+                    {pairing.paired_at ? ' · ' + new Date(pairing.paired_at).toLocaleDateString() : ''}
                   </p>
                 </div>
               </div>
-              <button className="btn-ghost btn-danger" onClick={handleUnpair}>
-                Unpair device
-              </button>
+              <button className="btn-ghost btn-danger" onClick={handleUnpair}>Unpair</button>
             </div>
           )}
         </section>
 
+        {/* ── Harness Support ── */}
         <section className="card">
-          <h2 className="card-title">Harness Mobile Support</h2>
-          <p className="card-sub">
-            Toggle which coding agents stream to your phone for approval. Each harness is
-            independent — turning one on never touches the others. Toggle off to return to a
-            normal CLI session for that harness, no cleanup needed.
-          </p>
+          <h2 className="card-title">Harness Support</h2>
 
-          {harnesses.filter(h => h.installed).length === 0 && (
-            <p className="hook-hint">
+          {installed.length === 0 && (
+            <p className="hook-hint" style={{ marginLeft: 0 }}>
               No supported agent CLI detected on this machine. Install Claude Code, OpenCode,
               or Gemini CLI, then reopen this app.
             </p>
           )}
 
-          {harnesses.filter(h => h.installed).map(h => (
+          {installed.map(h => (
             <div key={h.harness} className="harness-row">
               <div className="toggle-row">
                 <div className="toggle-info">
-                  <span className={`status-dot ${h.mobile_enabled ? 'on' : 'off'}`} />
-                  <span className="status-label">
+                  <span className="harness-bubble"><HarnessGlyph harness={h.harness} /></span>
+                  <span className="harness-name">
                     {h.displayName}
                     {h.version ? <span className="harness-ver"> · {h.version}</span> : null}
-                    {' — '}
-                    {h.mobile_enabled ? 'Mobile Mode Active' : 'Off'}
                   </span>
                 </div>
                 <button

@@ -167,6 +167,45 @@ function readyOC(sessionId) {
   dbg(`session.idle → cleared busy + ready flag for ${sessionId}`)
 }
 
+// ── Answer the NATIVE OpenCode `question` tool ────────────────────────────────
+// OpenCode emits `question.asked` and suspends the tool on a Deferred until something
+// calls question.reply(). The runtime UI does this via client.question.reply(); the
+// installed plugin SDK (1.16.2) has no `question` namespace, so we POST directly to the
+// server. Route (matches the SDK convention, no /api prefix):
+//   POST {serverUrl}/session/{sessionID}/question/{requestID}/reply   body { answers }
+// answers = ReadonlyArray<string[]> — one array of selected LABELS per question.
+// See opencode-question-tool-internals.md.
+async function replyNativeQuestion({ serverUrl, client, sessionID, requestID, directory, answers }) {
+  // 1) Typed client first (future SDK versions that expose .question).
+  try {
+    if (client?.question?.reply) {
+      await client.question.reply({ path: { sessionID, requestID }, body: { answers }, query: directory ? { directory } : undefined })
+      dbg(`native question replied via client.question.reply`)
+      return true
+    }
+  } catch (err) { dbg(`client.question.reply failed: ${err.message}`) }
+
+  // 2) Direct HTTP POST (1.16.2 client lacks .question). Try the root path, then /api.
+  if (!serverUrl) { dbg('replyNativeQuestion: no serverUrl'); return false }
+  const base = String(serverUrl).replace(/\/+$/, '')
+  const dq   = directory ? `?directory=${encodeURIComponent(directory)}` : ''
+  for (const url of [
+    `${base}/session/${sessionID}/question/${requestID}/reply${dq}`,
+    `${base}/api/session/${sessionID}/question/${requestID}/reply${dq}`,
+  ]) {
+    try {
+      const res = await fetch(url, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ answers }),
+      })
+      dbg(`native question reply POST ${url} → ${res.status}`)
+      if (res.ok) return true
+    } catch (err) { dbg(`native question reply POST ${url} failed: ${err.message}`) }
+  }
+  return false
+}
+
 // ── Shared terminal-event helper ──────────────────────────────────────────────
 async function postTerminalEvent(e, payload) {
   if (!e.apiUrl) { dbg('postTerminalEvent skipped — no apiUrl'); return }
@@ -186,8 +225,8 @@ async function postTerminalEvent(e, payload) {
 // per-token streaming updates don't create a flood of duplicate rows.
 const _postedParts = new Set()
 
-export const VibeRelay = async ({ project, directory } = {}) => {
-  dbg(`plugin loaded — flag=${fs.existsSync(FLAG_FILE)} dir=${directory ?? '?'}`)
+export const VibeRelay = async ({ project, directory, serverUrl, client } = {}) => {
+  dbg(`plugin loaded — flag=${fs.existsSync(FLAG_FILE)} dir=${directory ?? '?'} serverUrl=${serverUrl ?? '?'}`)
 
   // ── Custom "ask the user a choice" tool — the mobile question picker for OpenCode.
   // OpenCode has no built-in AskUserQuestion tool, so we register one here. Unlike the
@@ -277,16 +316,15 @@ export const VibeRelay = async ({ project, directory } = {}) => {
     // Nudge the model to use askUserQuestion when mobile mode is on, so a remote
     // user gets a tappable picker instead of a plain-text question they must type.
     'experimental.chat.system.transform': async (_input, output) => {
-      if (!fs.existsSync(FLAG_FILE) || !askTool) { dbg('system.transform skipped (flag/askTool)'); return }
+      if (!fs.existsSync(FLAG_FILE)) return
       try {
         output.system.push(
-          'CRITICAL — HOW TO ASK THE USER ANYTHING: The user is REMOTE, on a phone, and CANNOT ' +
-          'read or answer questions you type as plain text. A prose question will go unanswered ' +
-          'forever and you will stall. The ONLY way to ask the user a question is to call the ' +
-          '`askUserQuestion` tool. This applies to EVERY question without exception — multiple ' +
-          'choice, yes/no confirmations, and open-ended prompts. Never put a question to the user ' +
-          'in prose or wait for a typed reply; always call `askUserQuestion` with the question and ' +
-          'its options (use "Yes"/"No" for confirmations).'
+          'CRITICAL — HOW TO ASK THE USER ANYTHING: The user is REMOTE (on a phone) and CANNOT ' +
+          'read or answer questions you type as plain text — a prose question goes unanswered and ' +
+          'you will stall. To ask the user ANYTHING — choosing between options, yes/no ' +
+          'confirmations, or open-ended input — use the `question` tool with the question and its ' +
+          'options (use "Yes"/"No" for confirmations; set multiple:true to allow several ' +
+          'selections). Never put a question to the user in prose or wait for a typed reply.'
         )
         dbg('system.transform nudge added')
       } catch (err) { dbg(`system.transform error: ${err.message}`) }
@@ -359,6 +397,63 @@ export const VibeRelay = async ({ project, directory } = {}) => {
     // so each reasoning/response block becomes one chat bubble.
     event: async ({ event }) => {
       if (!fs.existsSync(FLAG_FILE)) return
+
+      // ── NATIVE question tool → mobile ──────────────────────────────────────
+      // OpenCode's built-in `question` tool emits `question.asked` and suspends until
+      // question.reply() is called. This is what the model uses by default, so we route
+      // it to mobile and reply with the user's selection — no dependency on the model
+      // choosing our custom askUserQuestion tool. See opencode-question-tool-internals.md.
+      if (event?.type === 'question.asked') {
+        const p          = event.properties || {}
+        const sessionID  = p.sessionID
+        const requestID  = p.id
+        const rawQs      = Array.isArray(p.questions) ? p.questions : []
+        dbg(`question.asked requestID=${requestID} session=${sessionID} qs=${rawQs.length}`)
+        const e = env()
+        if (!e.apiUrl || !sessionID || !requestID || rawQs.length === 0) return
+
+        // OpenCode schema → mobile shape (note: OpenCode uses `multiple`, we use multiSelect).
+        const questions = rawQs.map(q => ({
+          header:      q.header,
+          question:    q.question,
+          multiSelect: q.multiple === true,
+          options:     (q.options || []).map(o => ({ label: o.label, description: o.description })),
+        }))
+
+        recordPid(sessionID)
+        agentPing(e, sessionID, directory ?? null)
+
+        const summary = questions[0].header
+          ? `${questions[0].header}: ${questions[0].question}`
+          : questions[0].question
+        postTerminalEvent(e, { session_id: sessionID, event_type: 'tool_start', tool_name: 'question', summary })
+
+        const row = {
+          id: randomUUID(), harness: 'opencode', kind: 'question',
+          user_id: e.userId, machine_id: e.machineId, session_id: sessionID,
+          tool_name: 'question', display_type: 'question', summary,
+          risk_level: 'low', risk_reason: 'OpenCode is asking you to choose', risk_icon: '❓',
+          files_affected: [], question: { questions }, status: 'pending',
+          created_at: new Date().toISOString(),
+        }
+
+        let selected
+        try { selected = await uploadAndWaitAnswer(e, row) }
+        catch (err) { dbg(`native question upload failed: ${err.message}`); return }
+        if (!selected) { dbg('native question: no answer within timeout — leaving for local TUI'); return }
+
+        // mobile selected_options → OpenCode answers: one string[] of labels per question.
+        const answers = rawQs.map((_q, i) => {
+          const ans = selected.find(a => a.question_index === i)
+          if (!ans) return []
+          const labels = (ans.selected || []).map(s => s.label)
+          if (ans.custom_text) labels.push(ans.custom_text)
+          return labels
+        })
+
+        await replyNativeQuestion({ serverUrl, client, sessionID, requestID, directory, answers })
+        return
+      }
 
       // Turn ended → clear busy + drop a ready flag so the heartbeat injects any queued
       // prompt for this now-idle session within ~1s. See FAST_PROMPT_DELIVERY_DESIGN.md.

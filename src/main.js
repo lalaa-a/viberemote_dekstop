@@ -277,17 +277,21 @@ ipcMain.handle('window:isMaximized', () => {
 
 const createWindow = () => {
   const mainWindow = new BrowserWindow({
-    width: 900,
-    height: 700,
-    minWidth: 700,
-    minHeight: 550,
+    width: 400,
+    height: 780,
+    minWidth: 360,
+    minHeight: 560,
+    maxWidth: 520,
     frame: false,
+    // Packaged builds get their icon baked into the exe via packagerConfig.icon
+    // (src/ is excluded from packaging, so this path only resolves in dev).
+    icon: app.isPackaged ? undefined : path.join(__dirname, '..', '..', 'src', 'assets', 'logo', 'vibeRemote_icon.png'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
     },
-    backgroundColor: '#0a0b10',
+    backgroundColor: '#082134',
   });
 
   mainWindow.on('maximize', () =>
