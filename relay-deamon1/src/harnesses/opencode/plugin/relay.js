@@ -225,8 +225,57 @@ async function postTerminalEvent(e, payload) {
 // per-token streaming updates don't create a flood of duplicate rows.
 const _postedParts = new Set()
 
+// Sessions we aborted because of a mobile Stop. abortIfStopRequested already posts the
+// "Stopped" turn-end tag, so the session.idle handler must SKIP its own "Task finished" post
+// for these — otherwise the chat shows both tags. We match by session id AND by a short
+// timestamp window, because the id on the session.idle event doesn't always match the id on
+// the part/tool event we aborted from (different OpenCode event shapes). In-memory — the
+// plugin is long-lived.
+const _abortedByFlag = new Set()
+let _lastAbortAt = 0
+
+// The heartbeat drops this flag when the phone taps Stop. We consume it from INSIDE OpenCode
+// and abort via our own `client` — the reliable path, because the heartbeat's separate SDK
+// client is pinned to OPENCODE_URL (localhost:4096) and usually can't reach the real server,
+// so its direct abort silently no-ops and the CLI keeps generating. Mirrors claude's flag.
+const stopFlag = (sessionId) => path.join(PID_DIR, `relay-stop-${sessionId}.flag`)
+
 export const VibeRelay = async ({ project, directory, serverUrl, client } = {}) => {
   dbg(`plugin loaded — flag=${fs.existsSync(FLAG_FILE)} dir=${directory ?? '?'} serverUrl=${serverUrl ?? '?'}`)
+
+  // Abort the in-flight turn if the phone requested a Stop for this session. Runs from inside
+  // OpenCode using the plugin's own `client`, so it actually reaches the running server. Called
+  // on the frequent streaming events (tool.execute.before / message.part.updated), so a stop
+  // lands within a token or two. Returns true if it consumed a stop flag.
+  const abortIfStopRequested = async (sessionID) => {
+    if (!sessionID) return false
+    let armed = false
+    try { armed = fs.existsSync(stopFlag(sessionID)) } catch { return false }
+    if (!armed) return false
+    try { fs.unlinkSync(stopFlag(sessionID)) } catch {}   // one-shot: don't halt the NEXT turn too
+    _abortedByFlag.add(sessionID)   // tells session.idle to skip its own "Task finished" post
+    _lastAbortAt = Date.now()       // fallback dedup if the session.idle id doesn't match
+    try {
+      await client?.session?.abort?.({ path: { id: sessionID } })   // POST /session/:id/abort
+      dbg(`mobile stop → aborted session ${sessionID}`)
+    } catch (err) {
+      dbg(`session.abort failed for ${sessionID}: ${err.message}`)
+    }
+    // Post the "Stopped" turn-end tag NOW — immediate and reliable: we know it's a user stop
+    // here, so it doesn't depend on session.idle firing or on session-id formats matching.
+    // status:'stopped' is what the mobile StopRow renders as the "Stopped" tag.
+    const e = env()
+    if (e.apiUrl) {
+      postTerminalEvent(e, {
+        session_id: sessionID,
+        event_type: 'stop',
+        tool_name:  null,
+        summary:    'Stopped from mobile — turn halted.',
+        status:     'stopped',
+      })
+    }
+    return true
+  }
 
   // ── Custom "ask the user a choice" tool — the mobile question picker for OpenCode.
   // OpenCode has no built-in AskUserQuestion tool, so we register one here. Unlike the
@@ -338,6 +387,10 @@ export const VibeRelay = async ({ project, directory, serverUrl, client } = {}) 
     // ── 1. Tool gating ────────────────────────────────────────────────────────
     'tool.execute.before': async (input, output) => {
       if (!fs.existsSync(FLAG_FILE)) return
+      // Phone tapped Stop → abort the turn before this tool runs.
+      if (await abortIfStopRequested(input.sessionID)) {
+        throw new Error('Stopped from the Vibe Remote mobile app')
+      }
       markBusyOC(input.sessionID)            // any tool call → a turn is in flight
       if (!GATED.has(input.tool)) return
 
@@ -462,6 +515,31 @@ export const VibeRelay = async ({ project, directory, serverUrl, client } = {}) 
         const sid = p.sessionID || p.info?.id || p.session?.id || p.sessionId
         dbg(`session.idle received — sid=${sid ?? '(none)'} keys=${Object.keys(p).join(',')}`)
         readyOC(sid)
+        // Emit a turn-end `stop` event (Claude's Stop hook does this; OpenCode didn't).
+        // The mobile composer keys off this reliable feed broadcast to unlock the input
+        // the instant the turn ends, and the server backdates last_activity_at on `stop`
+        // so the session's status flips to idle immediately instead of on the 15s poll.
+        if (sid) {
+          const e = env()
+          if (e.apiUrl) {
+            // If WE aborted this session for a mobile Stop, abortIfStopRequested already
+            // posted the "Stopped" turn-end tag — skip so we don't double up. Match by id,
+            // and fall back to a short time window since the session.idle id doesn't always
+            // match the part/tool id we aborted from. Otherwise it's a natural turn-end.
+            const justAborted = _abortedByFlag.delete(sid) || (Date.now() - _lastAbortAt < 4000)
+            if (justAborted) {
+              _lastAbortAt = 0   // consume the window so the NEXT natural finish still posts
+            } else {
+              postTerminalEvent(e, {
+                session_id: sid,
+                event_type: 'stop',
+                tool_name:  null,
+                summary:    'Task finished',
+                status:     'success',
+              })
+            }
+          }
+        }
         return
       }
 
@@ -470,6 +548,9 @@ export const VibeRelay = async ({ project, directory, serverUrl, client } = {}) 
       const part = event.properties?.part
       if (!part) return
       if (part.type !== 'text' && part.type !== 'reasoning') return
+      // Phone tapped Stop → abort mid-stream. Checked here because message.part.updated fires
+      // continuously while the model generates, so a stop lands almost immediately.
+      if (await abortIfStopRequested(part.sessionID)) return
       markBusyOC(part.sessionID)                        // output is streaming → a turn is in flight
       if (part.synthetic) return                       // skip auto-generated parts
 

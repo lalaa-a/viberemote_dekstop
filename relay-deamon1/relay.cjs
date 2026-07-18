@@ -60,13 +60,19 @@ const ALLOW_ALL_FILE = path.join(TEMP_DIR, 'relay-allow-all.txt')
 function machineEnvFile() {
   if (process.env.VIBE_MACHINE_ENV) return process.env.VIBE_MACHINE_ENV
   const os = require('os')
-  const appName = 'my-app'
-  const stable = process.platform === 'win32'
-    ? path.join(os.homedir(), 'AppData', 'Roaming', appName, 'machine.env')
+  // Probe every dir name this app has shipped under (productName drives Electron's
+  // userData path and has changed across releases). Keep in sync with src/machineEnv.js.
+  const appNames = ['VibeRemote', 'Vibe Remote', 'vibe-remote', 'my-app']
+  const root = process.platform === 'win32'
+    ? path.join(os.homedir(), 'AppData', 'Roaming')
     : process.platform === 'darwin'
-      ? path.join(os.homedir(), 'Library', 'Application Support', appName, 'machine.env')
-      : path.join(os.homedir(), '.config', appName, 'machine.env')
-  return fs.existsSync(stable) ? stable : path.join(__dirname, '.env')
+      ? path.join(os.homedir(), 'Library', 'Application Support')
+      : path.join(os.homedir(), '.config')
+  for (const n of appNames) {
+    const p = path.join(root, n, 'machine.env')
+    if (fs.existsSync(p)) return p
+  }
+  return path.join(__dirname, '.env')
 }
 
 function loadEnv() {

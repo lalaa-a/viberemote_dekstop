@@ -13,7 +13,7 @@
  */
 
 import { postTerminalEvent } from './src/supabase.js'
-import { mkdirSync, writeFileSync } from 'fs'
+import { mkdirSync, writeFileSync, existsSync, unlinkSync } from 'fs'
 import { join } from 'path'
 
 const TRANSCRIPT_DIR = 'C:\\temp\\transcript-paths'
@@ -23,6 +23,24 @@ function recordTranscriptPath(sessionId, transcriptPath) {
     mkdirSync(TRANSCRIPT_DIR, { recursive: true })
     writeFileSync(join(TRANSCRIPT_DIR, `${sessionId}.path`), transcriptPath, 'utf8')
   } catch {}
+}
+
+// ── Stop (interrupt the turn) ─────────────────────────────────────────────────
+// PreToolUse (hook.js) catches a stop before the NEXT tool runs. This catches the case
+// where there is no next tool — the turn ends in plain text — so the stop would
+// otherwise be silently dropped and only land on some later turn.
+//
+// PostToolUse can't block the tool (it already ran), but `continue: false` is honoured
+// on every hook event and halts Claude outright. See STOP_AGENT_DESIGN.md.
+const stopFlag = (sessionId) => `C:\\temp\\relay-stop-${sessionId}.flag`
+
+function stopRequested(sessionId) {
+  if (!sessionId) return false
+  try {
+    if (!existsSync(stopFlag(sessionId))) return false
+    unlinkSync(stopFlag(sessionId))   // one-shot
+    return true
+  } catch { return false }
 }
 
 function readStdin(ms) {
@@ -82,6 +100,30 @@ async function main() {
     detail,
     status: isError ? 'error' : 'success',
   }).catch(() => {})
+
+  // Phone hit Stop while this tool was running → halt now, rather than letting the
+  // model produce another round of output first.
+  if (stopRequested(session_id)) {
+    if (session_id) {
+      try { unlinkSync(`C:\\temp\\relay-busy-${session_id}.flag`) } catch {}
+    }
+    // Emit a `stop` (turn-end) event so the mobile feed unlocks the composer the instant the
+    // turn halts — the phone keys off this reliable feed broadcast, not the laggy sessions
+    // poll. (Matches the PreToolUse halt path in hook.js.)
+    await postTerminalEvent({
+      session_id,
+      event_type: 'stop',
+      tool_name:  null,
+      summary:    'Stopped from mobile — turn halted.',
+      detail:     null,
+      status:     'stopped',   // mobile StopRow renders this as a "Stopped" tag
+    }).catch(() => {})
+    process.stdout.write(JSON.stringify({
+      continue:   false,
+      stopReason: 'Stopped from the VibeRemote mobile app',
+    }))
+    process.exit(0)
+  }
 
   process.exit(0)
 }

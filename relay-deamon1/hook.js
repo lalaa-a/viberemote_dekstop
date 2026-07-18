@@ -35,6 +35,41 @@ const CURRENT_FILE     = 'C:\\temp\\relay-current.txt'
 const ALLOW_ALL_FILE   = 'C:\\temp\\relay-allow-all.txt'
 const TRANSCRIPT_DIR   = 'C:\\temp\\transcript-paths'
 
+// ── Stop (interrupt the turn) ─────────────────────────────────────────────────
+// Claude Code exposes NO external interrupt API, and OS keystroke injection (ESC via
+// WriteConsoleInput) does not reach the CLI when it runs under a ConPTY — which is the
+// normal case in Windows Terminal and VS Code's integrated terminal. The API reports
+// "records written" and the key is simply never consumed.
+//
+// Hooks are the only supported control surface. A hook that prints
+//   { "continue": false, "stopReason": "..." }
+// on stdout and exits 0 halts Claude entirely — this takes precedence over
+// permissionDecision and ends the turn. The heartbeat drops a flag file when the phone
+// requests a stop; we consume it here, on the next tool call. See STOP_AGENT_DESIGN.md.
+const stopFlag = (sessionId) => `C:\\temp\\relay-stop-${sessionId}.flag`
+
+function stopRequested(sessionId) {
+  if (!sessionId) return false
+  try {
+    if (!existsSync(stopFlag(sessionId))) return false
+    unlinkSync(stopFlag(sessionId))   // one-shot: never halt the NEXT turn too
+    return true
+  } catch { return false }
+}
+
+// Halt Claude entirely. Exit 0 + this JSON is the documented contract; exit 2 would
+// only block the single tool call and let the model keep going.
+function haltExit(sessionId, reason) {
+  // The turn is over, so drop the busy flag ourselves — the Stop hook may not fire on
+  // a halted turn, and a stale busy flag locks the session out of every future prompt
+  // until its 60s TTL expires.
+  if (sessionId) {
+    try { unlinkSync(`C:\\temp\\relay-busy-${sessionId}.flag`) } catch {}
+  }
+  process.stdout.write(JSON.stringify({ continue: false, stopReason: reason }))
+  process.exit(0)
+}
+
 // Record this session's transcript path so heartbeat.js can tail it for narrative output.
 // Touched on every hook fire, so heartbeat can age out sessions where interception is off
 // (the mapping file's mtime stops updating).
@@ -304,6 +339,28 @@ async function main() {
   // mobile prompt mid-turn. The Stop hook clears it. See FAST_PROMPT_DELIVERY_DESIGN.md.
   if (event.session_id) {
     try { writeFileSync(`C:\\temp\\relay-busy-${event.session_id}.flag`, String(Date.now())) } catch {}
+  }
+
+  // Did the phone hit Stop? Check BEFORE the question branch and before any upload, so a
+  // stop wins over anything else this tool call would have done.
+  if (stopRequested(event.session_id)) {
+    debugLog(`stop flag consumed for ${event.session_id} — halting turn`)
+    logger.info('Stopped from mobile', { session: event.session_id })
+    // Emit a `stop` (turn-end) event, not a notification: the Stop hook does NOT fire on a
+    // halted turn, so this is the only turn-end signal the mobile feed gets. The phone keys
+    // its composer off this event (feed broadcast is instant & reliable, unlike the sessions
+    // poll) to unlock the input the moment the turn actually halts. MUST be awaited — haltExit
+    // calls process.exit immediately, which would otherwise kill this POST mid-flight.
+    await postTerminalEvent({
+      session_id: event.session_id,
+      event_type: 'stop',
+      tool_name:  null,
+      summary:    'Stopped from mobile — turn halted.',
+      detail:     null,
+      status:     'stopped',   // mobile StopRow renders this as a "Stopped" tag
+    }).catch(() => {})
+    haltExit(event.session_id, 'Stopped from the VibeRemote mobile app')
+    return
   }
 
   if(event.tool_name === "AskUserQuestion") {

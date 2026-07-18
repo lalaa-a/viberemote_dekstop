@@ -39,6 +39,15 @@ export async function agentPing(sessionId, cwd, toolName) {
   return apiPost('/relay/agent-ping', { sessionId, cwd, toolName })
 }
 
+// ── Keepalive: refresh only last_activity_at (no upsert) ──────────────────────
+// Called by the heartbeat while a turn is in flight so the server keeps deriving
+// status='active' through long reasoning phases and long single tools — the window
+// where mobile used to briefly see 'idle' and unlock the composer mid-turn. Unlike
+// agentPing this never touches cwd/harness, so it can't clobber them with nulls.
+export async function agentTouch(sessionId) {
+  return apiPost('/relay/agent-touch', { sessionId })
+}
+
 // ── Fetch next pending mobile command (idle-gated on server) ─────────────────
 // Pass a sessionId to scope the claim to that session — the desktop does this when it
 // knows that CLI is idle. command/next atomically marks the row delivered, so we must
@@ -65,6 +74,21 @@ export async function uploadRequest(row) {
 // ── Mark a request decided — used when PC terminal responds first ─────────────
 export async function markDecided(requestId, status, decidedBy = null) {
   return apiPost('/relay/decide', { requestId, decision: status })
+}
+
+// ── Stop requests (interrupt an in-flight turn) ───────────────────────────────
+// Poll backstop for the stop_requested broadcast — see STOP_AGENT_DESIGN.md.
+// Pass a sessionId to scope the poll to a single session; omit for an unscoped
+// sweep of every pending stop request on this machine.
+export async function pollStopRequests(sessionId) {
+  const qs = sessionId ? `?session=${encodeURIComponent(sessionId)}` : ''
+  const data = await apiGet(`/relay/stop-requests${qs}`)
+  return data?.requests ?? []
+}
+
+export async function ackStopRequests(ids) {
+  if (!ids?.length) return
+  return apiPost('/relay/stop-ack', { ids })
 }
 
 // ── Update machine heartbeat ──────────────────────────────────────────────────

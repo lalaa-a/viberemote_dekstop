@@ -521,22 +521,24 @@ const canSend  = prompt.trim().length > 0 && !sendPmt.isPending && canType
 ## 6. Implementation checklist
 
 **Server** (`vibe_remote(serverside)`)
-- [ ] `migrations/012_stop_requests.sql` — new table + index (§2.1)
-- [ ] `src/routes/mobile.js` — `POST /mobile/sessions/:sessionId/stop` (§2.2)
-- [ ] `src/routes/mobile.js` — `POST /mobile/prompt` gains a `session_busy` 409 reject when `deriveStatus(agent.last_activity_at) === 'active'` (§2.2b)
-- [ ] `src/routes/relay.js` — `GET /relay/stop-requests`, `POST /relay/stop-ack`; join `agents` to include `harness` in the poll response (§2.3)
+- [x] `migrations/012_stop_requests.sql` — new table + index (§2.1). Also stores `harness` directly on the row (captured at insert time) so `GET /relay/stop-requests` never needs to join `agents`.
+- [x] `src/routes/mobile.js` — `POST /mobile/sessions/:sessionId/stop` (§2.2)
+- [x] `src/routes/mobile.js` — `POST /mobile/prompt` gains a `session_busy` 409 reject when `deriveStatus(agent.last_activity_at) === 'active'` (§2.2b). Also had to add `last_activity_at` to that handler's existing `agents` select, since it wasn't previously selected.
+- [x] `src/routes/relay.js` — `GET /relay/stop-requests`, `POST /relay/stop-ack` (§2.3)
 
 **Desktop** (`vRdeksMultiharness/relay-deamon1`)
-- [ ] `src/harness-sdk/transport.js` — `pollStopRequests()`, `ackStopRequests()` (§3.1)
-- [ ] `src/harnesses/opencode/provider.js` — add `interrupter.send()` (§3.2)
-- [ ] `scripts/heartbeat.js` — `sendInterruptKey()`, `handleStopRequest()`, broadcast subscription, `checkStopRequests()` polling interval (§3.3–3.4); consider factoring the shared `Inj` C# type out of both `tryInjectIntoExistingTerminal` and `sendInterruptKey`'s PS1 templates into one embedded helper to avoid duplication
-- [ ] `src/harness-sdk/strategies/ptyProxy.js` — stop-poll timer inside `spawn()`, cleared in `stop()` (§3.5)
+- [x] `src/supabase.js` — `pollStopRequests()`, `ackStopRequests()` (used by `heartbeat.js`, which already imports its VPS calls from this file rather than `harness-sdk/transport.js`)
+- [x] `src/harness-sdk/transport.js` + `src/harness-sdk/index.js` — same two functions, exported for `ptyProxy.js` (§3.1)
+- [x] `src/harnesses/opencode/provider.js` — `interrupter.send()` via SDK `session.abort()` (§3.2)
+- [x] `scripts/heartbeat.js` — `sendInterruptKey()`, `handleStopRequest()`, `stop_requested` broadcast subscription, `checkStopRequests()` polling interval (§3.3–3.4). Fixed a bug in this doc's original snippet: the `SendKeys` fallback referenced a P/Invoke type named `Inj`, but the script only defined `InjKey` — the shipped version defines `SetForegroundWindow`/`ShowWindow` on `InjKey` itself so the fallback path actually compiles.
+- [x] `src/harness-sdk/strategies/ptyProxy.js` — stop-poll timer inside `spawn()`, cleared in `stop()`; also skips writing ESC while `gating` is true, per the §3.5 known-limitation note (chose the safer default proactively since it can't be manually verified against a live Gemini CLI session right now)
 
 **Mobile** (`AgentControl`)
-- [ ] `src/api/server.ts` — `stopSession()` (§2.4)
-- [ ] `src/hooks/useSessions.ts` — `useStopSession()` (§4.1)
-- [ ] `src/screens/Sessions/ChatScreen.tsx` — Stop UI branch in the compose bar + styles (§4.2)
-- [ ] `src/screens/Sessions/ChatScreen.tsx` — `canType`/`canSend` gain `&& !isActive` so sending is blocked at the state level, not just by branch order (§2.2b, §4.2)
+- [x] `src/api/server.ts` — `stopSession()` (§2.4)
+- [x] `src/hooks/useSessions.ts` — `useStopSession()` (§4.1)
+- [x] `src/screens/Sessions/ChatScreen.tsx` — Stop UI branch in the compose bar + styles (§4.2). Styles named `workingRow`/`workingStatus`/`workingStatusText`/`stopBtn*` rather than `stopRow`/`stopText` as originally sketched — those names were already taken by the existing feed's turn-ended divider row.
+- [x] `src/screens/Sessions/ChatScreen.tsx` — `canType`/`canSend` gain `&& !isActive` (§2.2b, §4.2)
 
 **Verification**
-- [ ] Manual E2E per harness per §5, on the actual Windows desktop build (this feature is inherently untestable by typecheck/lint alone — see §5)
+- [x] Syntax-checked every edited file (`node --check` on the desktop/server JS; structural read-through + `tsc` sanity pass on the mobile TS/TSX — a pre-existing `tsconfig.json` flag mismatch blocks a full project type-check in this environment, unrelated to these changes)
+- [ ] Manual E2E per harness per §5, on the actual Windows desktop build and a real OpenCode/Gemini CLI session — **not yet done**, needs a live run through all three harnesses

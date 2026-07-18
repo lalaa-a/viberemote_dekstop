@@ -1,7 +1,7 @@
 {
-  "name": "my-app",
-  "productName": "my-app",
-  "version": "1.3.0",
+  "name": "vibe-remote",
+  "productName": "VibeRemote",
+  "version": "1.4.0",
   "description": "Multi device pairable feature added",
   "main": ".vite/build/main.js",
   "private": true,

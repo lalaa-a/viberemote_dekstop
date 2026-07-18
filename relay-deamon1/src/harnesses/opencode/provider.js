@@ -102,4 +102,21 @@ export default {
       }
     },
   },
+
+  // Interrupt the current turn via SDK — no keystroke hack needed. This only
+  // aborts the in-flight generation on this session; the OpenCode server process
+  // (and any other sessions) keep running. See STOP_AGENT_DESIGN.md.
+  interrupter: {
+    async send(sessionId) {
+      const c = await client()
+      if (!c || !sessionId) return false
+      try {
+        await c.session.abort({ path: { id: sessionId } })
+        return true
+      } catch (err) {
+        console.warn('[opencode] abort failed:', err.message)
+        return false
+      }
+    },
+  },
 }

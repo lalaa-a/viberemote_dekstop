@@ -303,7 +303,7 @@ export default function Dashboard() {
               {pairing._error && (
                 <p className="card-sub" style={{ color: 'var(--error)' }}>Pairing check failed — {pairing._error}</p>
               )}
-              <p className="card-sub">Scan this QR code with the Vibe Remote app to connect your phone.</p>
+              <p className="card-sub">Scan this QR code with the VibeRemote app to connect your phone.</p>
               <div className="qr-wrap">
                 {qrData ? (
                   <div className="qr-box">

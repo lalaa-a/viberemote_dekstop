@@ -61,6 +61,11 @@ async function main() {
   if (event.session_id) {
     try { unlinkSync(`C:\\temp\\relay-busy-${event.session_id}.flag`) } catch {}
     try { writeFileSync(`C:\\temp\\relay-ready-${event.session_id}.flag`, '1') } catch {}
+
+    // Drop any unconsumed stop flag. The turn is over, so a stop that raced the finish
+    // line has nothing left to halt — and if it survived, the FIRST tool call of the
+    // user's next prompt would consume it and kill that prompt on arrival.
+    try { unlinkSync(`C:\\temp\\relay-stop-${event.session_id}.flag`) } catch {}
   }
 
   process.exit(0)

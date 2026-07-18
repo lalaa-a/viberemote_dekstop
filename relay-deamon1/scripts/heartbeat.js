@@ -14,9 +14,10 @@ import { spawn }                  from 'child_process'
 import fs                         from 'fs'
 import path                       from 'path'
 import os                         from 'os'
-import { supabase, heartbeat, markOffline, getNextCommand, getPendingFsRequest, respondFsRequest, postTerminalEvent, reportSessionsAlive } from '../src/supabase.js'
+import { supabase, heartbeat, markOffline, getNextCommand, getPendingFsRequest, respondFsRequest, postTerminalEvent, reportSessionsAlive, pollStopRequests, ackStopRequests, agentTouch } from '../src/supabase.js'
 import { config }                 from '../src/config.js'
 import { logger }                 from '../src/logger.js'
+import { getAdapter }             from '../src/registry.js'
 
 // Append a line to C:\temp\heartbeat.log — always works regardless of how
 // this process was started (manual terminal or spawned from Electron)
@@ -148,6 +149,12 @@ async function drainQueue(sessionId) {
 
     if (injectable && isSessionProcessAlive(cmd.sessionId) && !isBusy(cmd.sessionId)) {
       markBusy(cmd.sessionId)   // hold further prompts for this session until its Stop
+      // Clear any orphaned stop flag before starting this fresh turn. A turn halted by ESC
+      // (classic console) leaves its stop flag un-consumed — no hook fires to clear it — and
+      // the FIRST tool call of THIS new prompt would otherwise consume it and kill the prompt
+      // on arrival. We only reach here once the previous turn is over (!isBusy), so any
+      // surviving flag is guaranteed stale. Mirrors stopHook.js's own orphan cleanup.
+      try { fs.unlinkSync(`C:\\temp\\relay-stop-${cmd.sessionId}.flag`) } catch {}
       const injected = await tryInjectIntoExistingTerminal(cmd.sessionId, cmd.prompt)
       if (injected) {
         fileLog(`prompt injected into existing ${harness} terminal`)
@@ -172,6 +179,109 @@ async function drainQueue(sessionId) {
     fileLog(`drainQueue error: ${err.message}`)
     logger.warn('drainQueue failed', { err: err.message })
   }
+}
+
+// ── Stop requests (interrupt an in-flight turn) ───────────────────────────────
+// The opposite of drainQueue: prompt delivery deliberately WAITS for idle
+// (isBusy gate above); a stop request only matters WHILE busy and must bypass
+// every busy-gate that exists. This does NOT kill the harness CLI process — it
+// only interrupts the current turn, same as pressing Esc yourself. See
+// STOP_AGENT_DESIGN.md.
+async function handleStopRequest(sessionId, harness) {
+  if (!sessionId) return
+  try {
+    if (harness === 'opencode') {
+      // Only act on an in-flight turn (same gate as claude-code). A flag dropped while idle
+      // would linger and be consumed by the FIRST event of the user's NEXT turn, aborting it
+      // on arrival. An active turn keeps its busy flag warm (the plugin's markBusyOC fires on
+      // every streamed part) and its events consume the flag promptly, so this is reliable.
+      if (isBusy(sessionId)) {
+        // PRIMARY: drop the stop flag the in-process plugin consumes to abort via ITS OWN
+        // client. This is the reliable path — the plugin runs inside OpenCode and reaches the
+        // real server, whereas the heartbeat's separate SDK client is pinned to OPENCODE_URL
+        // (localhost:4096) and usually can't reach it, so a direct abort here silently no-ops
+        // and the CLI keeps generating. The plugin posts the turn-end `stop` event on the
+        // resulting session.idle (labeled "Stopped"), so we don't post one here. Mirrors claude.
+        writeStopFlag(sessionId)
+        // SECONDARY best-effort: also try a direct SDK abort in case OPENCODE_URL is correct
+        // (makes Stop feel instant where it happens to reach the server). Result is advisory.
+        try {
+          const adapter = await getAdapter('opencode')
+          const ok = await adapter?.interrupter?.send?.(sessionId)   // POST /session/:id/abort
+          fileLog(`opencode stop(${sessionId}) → flag armed, direct-abort=${ok}`)
+        } catch (err) {
+          fileLog(`opencode direct abort error: ${err.message}`)
+        }
+      } else {
+        fileLog(`opencode stop(${sessionId}) → session not mid-turn, nothing to stop`)
+      }
+    } else if (harness === 'gemini-cli') {
+      // Handled by the vibe-run-gemini-cli process itself, which owns the live PTY
+      // and polls for stop requests on its own (heartbeat has no reachable handle
+      // into that separate process). Nothing to do here.
+      fileLog(`gemini-cli stop request for ${sessionId} — handled by PTY wrapper process`)
+    } else {
+      // claude-code (default). TWO mechanisms, because neither alone is sufficient:
+      //
+      //  1. The stop FLAG (authoritative). Claude Code has no external interrupt API,
+      //     and the hooks are its only supported control surface. hook.js (PreToolUse)
+      //     and postHook.js (PostToolUse) consume this flag and emit
+      //     {"continue": false, ...}, which halts the turn outright. This lands on the
+      //     next hook event — typically within a second while the agent is working —
+      //     and it works in EVERY terminal.
+      //
+      //  2. The ESC keystroke (best-effort, instant). Only reaches the CLI on a classic
+      //     console host. Under a ConPTY — Windows Terminal, VS Code's integrated
+      //     terminal — WriteConsoleInput happily reports "records written" but the
+      //     client never consumes them, so the key silently evaporates. Hence the flag
+      //     above is what actually makes Stop reliable; this just makes it feel instant
+      //     where it happens to work.
+      // Only arm the flag if a turn is actually in flight. If the turn already ended,
+      // there is nothing to stop — and a flag left lying around would be consumed by
+      // the FIRST tool call of the user's NEXT prompt, killing it on arrival.
+      if (isBusy(sessionId)) {
+        writeStopFlag(sessionId)
+        const ok = isSessionProcessAlive(sessionId) ? await sendInterruptKey(sessionId) : false
+        fileLog(`claude-code stop(${sessionId}) → stop-flag armed, esc=${ok}`)
+        // Persist a turn-end `stop` event NOW. When ESC halts the turn (classic console),
+        // no further Claude hook fires — so hook.js/postHook.js never get to post the stop,
+        // and this becomes the ONLY turn-end signal the mobile feed ever receives. Without
+        // it, the session's last feed boundary stays an activity/output and the phone shows
+        // the harness "working" forever (obvious after leaving and reopening the chat, once
+        // the optimistic local override is gone). The server backdates last_activity_at on
+        // `stop`, so status also flips to idle. Harmless if a later hook posts one too.
+        await postTerminalEvent({
+          session_id: sessionId,
+          event_type: 'stop',
+          tool_name:  null,
+          summary:    'Stopped from mobile — turn halted.',
+          detail:     null,
+          status:     'stopped',   // mobile StopRow renders this as a "Stopped" tag
+        }).catch(() => {})
+      } else {
+        fileLog(`claude-code stop(${sessionId}) → session not mid-turn, nothing to stop`)
+      }
+    }
+  } finally {
+    // Don't leave a stale busy flag if the interrupt takes an unusual exit path; the
+    // hooks clear it too when they consume the stop flag.
+    clearBusy(sessionId)
+  }
+}
+
+// Drop the flag the Claude hooks consume to halt the turn (see hook.js / postHook.js).
+function writeStopFlag(sessionId) {
+  if (!sessionId) return
+  try { fs.writeFileSync(`C:\\temp\\relay-stop-${sessionId}.flag`, String(Date.now())) } catch {}
+}
+
+// Backstop poll — covers a missed stop_requested broadcast. Unscoped: one call
+// covers every pending stop request on this machine regardless of session.
+async function checkStopRequests() {
+  const pending = await pollStopRequests().catch(() => [])
+  if (!pending.length) return
+  for (const r of pending) await handleStopRequest(r.session_id, r.harness)
+  await ackStopRequests(pending.map(r => r.id)).catch(() => {})
 }
 
 // Build the CLI command (with the prompt in PowerShell var $p, or shell var) for
@@ -373,6 +483,157 @@ exit 0
   })
 }
 
+// ── Interrupt the current turn in an already-open Claude terminal ─────────────
+// Same PID-resolution as tryInjectIntoExistingTerminal above, but sends a single
+// VK_ESCAPE key event — same as pressing Esc yourself — instead of typed text +
+// Enter. This does NOT close the terminal or kill the claude process; it only
+// cancels the in-flight turn. Each call spawns a fresh powershell.exe process, so
+// there's no conflict with tryInjectIntoExistingTerminal's own Add-Type in the
+// same tick — every invocation gets its own process and its own type table.
+async function sendInterruptKey(sessionId) {
+  if (process.platform !== 'win32' || !sessionId) return false
+
+  const pidFile = `C:\\temp\\relay-pid-${sessionId}.txt`
+  if (!fs.existsSync(pidFile)) { fileLog(`no PID file for session ${sessionId} (interrupt)`); return false }
+  const claudePid = parseInt(fs.readFileSync(pidFile, 'utf8').trim())
+  if (!claudePid || isNaN(claudePid)) { fileLog(`invalid PID for interrupt: ${claudePid}`); return false }
+
+  const tmpDir    = process.env.TEMP || 'C:\\temp'
+  const tmpScript = path.join(tmpDir, `interrupt-${Date.now()}.ps1`)
+
+  const ps1 = `
+$log = "C:\\temp\\inject-log.txt"
+function L([string]$m) {
+    try { Add-Content -Path $log -Value ((Get-Date).ToString("HH:mm:ss") + " [interrupt] " + $m) } catch {}
+}
+
+L "=== interrupt start ===  claudePid=${claudePid}  session=${sessionId}"
+
+try {
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class InjKey {
+    [StructLayout(LayoutKind.Explicit, CharSet=CharSet.Unicode)]
+    public struct IR {
+        [FieldOffset(0)] public ushort T;
+        [FieldOffset(4)] public KER K;
+    }
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+    public struct KER {
+        public int    Down;
+        public ushort Rep;
+        public ushort Vk;
+        public ushort Sc;
+        public char   U;
+        public uint   Ctrl;
+    }
+    [DllImport("kernel32.dll")] public static extern bool FreeConsole();
+    [DllImport("kernel32.dll",SetLastError=true)] public static extern bool AttachConsole(uint pid);
+    [DllImport("kernel32.dll",SetLastError=true)] public static extern IntPtr GetStdHandle(int h);
+    [DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)] public static extern IntPtr CreateFileW(string n, uint a, uint s, IntPtr sec, uint d, uint f, IntPtr t);
+    [DllImport("kernel32.dll",SetLastError=true)] public static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll",SetLastError=true)] public static extern bool WriteConsoleInput(IntPtr h, IR[] b, uint n, out uint w);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+
+    // Writes ONE VK code as a key-down + key-up pair. Critically, it must also set
+    // UnicodeChar (U) on both records, exactly like Write() does for the Enter key
+    // above — WriteConsoleInput can report success while the character never reaches
+    // the reading process if U is left at its default (zero). Node's console reader
+    // (libuv's tty backend, which Claude Code's CLI runs on) takes the actual byte
+    // from UnicodeChar, not VirtualKeyCode, for control characters like ESC — so
+    // leaving U unset silently drops the keystroke even though WriteConsoleInput
+    // returns records-written > 0 and looks like it succeeded.
+    //
+    // NOTE: this whole C# block is a JS template literal. Never write a backslash
+    // escape here (not even inside a comment): JS resolves it before PowerShell or
+    // csc ever see it, so a stray CR/NUL lands mid-source and Add-Type dies with
+    // "Newline in constant". Escape it as \\ if you truly need one.
+    public static int WriteVk(uint pid, ushort vk, char ch) {
+        FreeConsole();
+        if (!AttachConsole(pid)) return 1000 + Marshal.GetLastWin32Error();
+        IntPtr h = CreateFileW("CONIN$", 0x80000000u | 0x40000000u, 0x1u | 0x2u, IntPtr.Zero, 3u, 0u, IntPtr.Zero);
+        if (h == IntPtr.Zero || h == new IntPtr(-1)) h = GetStdHandle(-10);
+        if (h == IntPtr.Zero || h == new IntPtr(-1)) { FreeConsole(); return 2000; }
+        var d = new IR(); d.T = 1; d.K = new KER { Down=1, Rep=1, Vk=vk, U=ch };
+        var u = new IR(); u.T = 1; u.K = new KER { Down=0, Rep=1, Vk=vk, U=ch };
+        var arr = new IR[] { d, u };
+        uint written;
+        bool ok = WriteConsoleInput(h, arr, (uint)arr.Length, out written);
+        int err = Marshal.GetLastWin32Error();
+        CloseHandle(h);
+        FreeConsole();
+        if (!ok) return 3000 + err;
+        return (int)written;
+    }
+}
+"@
+} catch {
+    L "Add-Type failed: $_"
+    exit 99
+}
+
+# ─── Method 1: WriteConsoleInput(ESC) ───────────────────────────────────────
+L "trying WriteConsoleInput(ESC)..."
+$wc = [InjKey]::WriteVk(${claudePid}, 0x1B, [char]0x1B)
+L "WriteConsoleInput(ESC) returned $wc"
+
+if ($wc -gt 0 -and $wc -lt 1000) {
+    L "SUCCESS via WriteConsoleInput"
+    exit 0
+}
+
+# ─── Method 2: focus + SendKeys ESC ──────────────────────────────────────────
+# No clipboard step here (unlike the prompt injector) — there's nothing to paste,
+# ESC isn't text.
+L "WriteConsoleInput did not write, falling back to SendKeys ESC"
+
+$walk = ""
+$p = Get-Process -Id ${claudePid} -EA SilentlyContinue
+$win = $null
+while ($p) {
+    $walk += "$($p.Name)[$($p.Id)] hwnd=$($p.MainWindowHandle.ToInt64()) -> "
+    if ($p.MainWindowHandle -ne [IntPtr]::Zero) { $win = $p; break }
+    $parent = (Get-CimInstance Win32_Process -Filter "ProcessId=$($p.Id)" -EA 0).ParentProcessId
+    if (-not $parent -or $parent -eq 0) { break }
+    $p = Get-Process -Id $parent -EA SilentlyContinue
+}
+L "process walk: $walk"
+
+if ($null -eq $win) { L "FAILED: no terminal window found in process tree"; exit 1 }
+L "terminal window: $($win.Name)  PID=$($win.Id)  hwnd=$($win.MainWindowHandle.ToInt64())"
+
+[void][InjKey]::ShowWindow($win.MainWindowHandle, 9)   # SW_RESTORE
+[void][InjKey]::SetForegroundWindow($win.MainWindowHandle)
+Start-Sleep -Milliseconds 300
+
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.SendKeys]::SendWait('{ESC}')
+
+L "SUCCESS via SendKeys ESC"
+exit 0
+`.trim()
+
+  fs.writeFileSync(tmpScript, ps1, 'utf8')
+  fileLog(`interrupt script written: ${tmpScript}  claudePid=${claudePid}`)
+
+  return new Promise((resolve) => {
+    const child = spawn('powershell', ['-ExecutionPolicy', 'Bypass', '-NonInteractive', '-File', tmpScript], {
+      stdio: 'ignore',
+      shell: false,
+    })
+    child.on('close', code => {
+      fileLog(`interrupt exit code=${code}  (see C:\\temp\\inject-log.txt for details)`)
+      resolve(code === 0)
+    })
+    child.on('error', err => {
+      fileLog(`interrupt spawn error: ${err.message}`)
+      resolve(false)
+    })
+  })
+}
+
 // ── Open a new visible terminal window running the harness with the prompt ────
 function openNewTerminalWindow(cmd, spawnCwd, harness = 'claude-code') {
   if (process.platform === 'win32') {
@@ -386,7 +647,7 @@ function openNewTerminalWindow(cmd, spawnCwd, harness = 'claude-code') {
       'utf8'
     )
     const escaped = tmpScript.replace(/"/g, '\\"')
-    const shellCmd = `start "Vibe Remote — ${harness}" powershell -NoExit -ExecutionPolicy Bypass -File "${escaped}"`
+    const shellCmd = `start "VibeRemote — ${harness}" powershell -NoExit -ExecutionPolicy Bypass -File "${escaped}"`
     fileLog(`new window (${harness}): ${runCmd}`)
     const child = spawn(shellCmd, [], {
       cwd: spawnCwd, stdio: 'ignore', env: { ...process.env }, detached: true, shell: true,
@@ -531,6 +792,7 @@ async function tailOneTranscript(sessionId, mappingFile) {
   transcriptPositions.set(sessionId, lastPos + lastNewline + 1)
 
   const lines = text.slice(0, lastNewline).split('\n').filter(l => l.trim())
+  let forwardedOutput = false
   for (const line of lines) {
     let entry
     try { entry = JSON.parse(line) } catch { continue }
@@ -542,6 +804,7 @@ async function tailOneTranscript(sessionId, mappingFile) {
       if (block.type !== 'text') continue
       const t = (block.text || '').trim()
       if (!t) continue
+      forwardedOutput = true
       postTerminalEvent({
         session_id: sessionId,
         event_type: 'output',
@@ -551,6 +814,21 @@ async function tailOneTranscript(sessionId, mappingFile) {
         status:     null,
       }).catch(() => {})
     }
+  }
+
+  // Fresh reasoning just streamed → keep an IN-FLIGHT turn active: refresh last_activity_at
+  // so the server holds status='active' through a long reasoning phase that fires no tool
+  // calls, and keep the busy flag warm so it can't age out mid-turn.
+  //
+  // Gate on isBusy: only a turn that's actually running should be kept alive. Without this
+  // gate, a session that was JUST stopped gets silently revived here — the halted turn's
+  // final partial reasoning flushes into the transcript a beat after the stop, and touching
+  // last_activity_at would flip status back to 'active' for ~30s, making the (now-visible)
+  // send bar reject the user's next prompt as session_busy. The stop path clears the busy
+  // flag, so a stopped session is skipped and stays idle.
+  if (forwardedOutput && isBusy(sessionId)) {
+    markBusy(sessionId)
+    agentTouch(sessionId).catch(() => {})
   }
 }
 
@@ -620,6 +898,12 @@ function subscribeCommandNudge() {
         fileLog('mobile_commands INSERT — draining')
         drainQueue(p?.new?.session_id || undefined)
       })
+      // NEW: interrupt an in-flight turn — bypasses every busy-gate on purpose,
+      // the opposite of the prompt-delivery nudges above. See STOP_AGENT_DESIGN.md.
+      .on('broadcast', { event: 'stop_requested' }, ({ payload }) => {
+        fileLog(`stop_requested broadcast — session=${payload?.sessionId} harness=${payload?.harness}`)
+        handleStopRequest(payload?.sessionId, payload?.harness)
+      })
       .subscribe((status) => {
         if (status === 'SUBSCRIBED') fileLog('command nudge subscribed (broadcast + pg)')
       })
@@ -667,6 +951,27 @@ function drainBackstop() {
   if (!anyLive) drainQueue()   // session-less fallback (server applies its legacy gate)
 }
 
+// ── Active-turn keepalive (10s) ───────────────────────────────────────────────
+// deriveStatus on the server flips a session to 'idle' 30s after the last activity ping,
+// and pings previously fired ONLY on tool calls — so a long reasoning phase or a long
+// single tool made mobile briefly show 'idle' mid-turn and unlock the composer, letting a
+// prompt slip in while the agent was still working. Every session with a live busy flag
+// (the authoritative "turn in flight" signal, set on each tool call / prompt inject and
+// cleared by the Stop hook) gets its last_activity_at refreshed here, so status stays
+// 'active' for the whole turn — the mobile lock and the desktop busy-gate now agree.
+function keepActiveTurnsAlive() {
+  let files
+  try { files = fs.readdirSync('C:\\temp') } catch { return }
+  for (const f of files) {
+    const m = /^relay-busy-(.+)\.flag$/.exec(f)
+    if (!m) continue
+    const sid = m[1]
+    // isBusy() also ages out (and unlinks) a stale flag past its TTL, so a stuck/failed
+    // inject stops getting touched and correctly decays to idle.
+    if (isBusy(sid)) agentTouch(sid).catch(() => {})
+  }
+}
+
 // ── Shutdown ──────────────────────────────────────────────────────────────────
 
 async function shutdown() {
@@ -692,4 +997,6 @@ setInterval(drainBackstop,          3_000)   // backstop only — broadcast + re
 setInterval(checkReadyFlags,        1_000)   // inject queued prompts the instant a turn ends
 setInterval(checkFsRequests,        5_000)
 setInterval(checkTranscripts,       3_000)
+setInterval(keepActiveTurnsAlive,  10_000)   // hold status='active' through long reasoning / long tools
 setInterval(reportSessionLiveness, 15_000)
+setInterval(checkStopRequests,      5_000)   // backstop only — stop_requested broadcast is primary

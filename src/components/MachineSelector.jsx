@@ -58,7 +58,7 @@ export default function MachineSelector({ machines, hostname, onReclaim, onNew, 
       <div className="selector-card">
         <div className="selector-logo">
           <img src={vibeRemoteLogo} className="logo-icon" alt="" />
-          <span className="logo-text">Vibe Remote</span>
+          <span className="logo-text">VibeRemote</span>
         </div>
 
         <h2 className="selector-title">Restore an existing machine</h2>

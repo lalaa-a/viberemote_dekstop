@@ -13,8 +13,8 @@ const RELAY_ROOT = app.isPackaged
   ? path.join(process.resourcesPath, 'relay-deamon1')
   : path.join(__dirname, '..', '..', 'relay-deamon1');
 
-// Machine credentials live in the STABLE userData dir (%APPDATA%\my-app), NOT in
-// the versioned app resources — otherwise every reinstall / Squirrel update wipes
+// Machine credentials live in the STABLE userData dir (%APPDATA%\<productName>), NOT
+// in the versioned app resources — otherwise every reinstall / Squirrel update wipes
 // them (forge postPackage strips the bundled .env), forcing a re-registration and
 // a fresh API key on each update. userData survives reinstalls.
 const RELAY_ENV       = path.join(app.getPath('userData'), 'machine.env');
@@ -22,15 +22,33 @@ const LEGACY_RELAY_ENV = path.join(RELAY_ROOT, '.env');   // pre-1.2 location, f
 const CLAUDE_SETTINGS = path.join(os.homedir(), '.claude', 'settings.json');
 const ALLOW_ALL_FILE  = 'C:\\temp\\relay-allow-all.txt';
 
-// One-time migration: if the old bundled .env exists but the stable one doesn't,
-// move the machine identity to userData so we never re-register on this machine.
+// Electron derives userData from package.json `productName`, so RENAMING THE APP MOVES
+// IT. Every past name must be migrated forward, or the new userData dir comes up empty,
+// Dashboard sees no MACHINE_ID, self-registers a brand-new machine, and the phone is
+// left paired to a machine that no longer reports — the exact failure the 'Vibe Remote'
+// rename caused. Newest-first; keep in sync with relay-deamon1/src/machineEnv.js.
+const PRIOR_APP_DIR_NAMES = ['Vibe Remote', 'vibe-remote', 'my-app'];
+
+function priorMachineEnvPaths() {
+  const root = path.dirname(app.getPath('userData'));   // %APPDATA% (or platform equivalent)
+  return PRIOR_APP_DIR_NAMES
+    .map((n) => path.join(root, n, 'machine.env'))
+    .filter((p) => p !== RELAY_ENV);
+}
+
+// One-time migration: bring the machine identity forward from any previous location —
+// an older app name's userData dir, or the pre-1.2 bundled .env — so we never
+// re-register (and never orphan the phone's pairing) on this machine.
 function migrateMachineEnv() {
   try {
-    if (!existsSync(RELAY_ENV) && existsSync(LEGACY_RELAY_ENV)) {
-      mkdirSync(path.dirname(RELAY_ENV), { recursive: true });
-      writeFileSync(RELAY_ENV, readFileSync(LEGACY_RELAY_ENV, 'utf8'), 'utf8');
-      console.log('[machine-env] migrated credentials to', RELAY_ENV);
-    }
+    if (existsSync(RELAY_ENV)) return;   // already in the current location
+
+    const source = [...priorMachineEnvPaths(), LEGACY_RELAY_ENV].find((p) => existsSync(p));
+    if (!source) return;                 // genuinely first run — Dashboard will register
+
+    mkdirSync(path.dirname(RELAY_ENV), { recursive: true });
+    writeFileSync(RELAY_ENV, readFileSync(source, 'utf8'), 'utf8');
+    console.log('[machine-env] migrated credentials from', source, '->', RELAY_ENV);
   } catch (err) {
     console.error('[machine-env] migration failed:', err.message);
   }
