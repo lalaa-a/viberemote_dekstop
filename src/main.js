@@ -20,7 +20,18 @@ const RELAY_ROOT = app.isPackaged
 const RELAY_ENV       = path.join(app.getPath('userData'), 'machine.env');
 const LEGACY_RELAY_ENV = path.join(RELAY_ROOT, '.env');   // pre-1.2 location, for migration
 const CLAUDE_SETTINGS = path.join(os.homedir(), '.claude', 'settings.json');
-const ALLOW_ALL_FILE  = 'C:\\temp\\relay-allow-all.txt';
+
+// Runtime/log dirs shared with the daemon. MUST match RUNTIME_DIR/LOG_DIR in
+// relay-deamon1/src/paths.js — the heartbeat and hooks are SEPARATE processes that
+// coordinate through these files, so every process must compute the identical path.
+// Use os.homedir() (NOT app.getPath('userData'), which is Roaming) to match the daemon's Local path.
+const RELAY_LOCAL_APPDATA =
+  process.platform === 'win32'  ? path.join(os.homedir(), 'AppData', 'Local')
+  : process.platform === 'darwin' ? path.join(os.homedir(), 'Library', 'Application Support')
+  : path.join(os.homedir(), '.local', 'share');
+const RELAY_RUNTIME_DIR = path.join(RELAY_LOCAL_APPDATA, 'VibeRemote', 'runtime');
+const RELAY_LOG_DIR     = path.join(RELAY_LOCAL_APPDATA, 'VibeRemote', 'logs');
+const ALLOW_ALL_FILE  = path.join(RELAY_RUNTIME_DIR, 'relay-allow-all.txt');
 
 // Electron derives userData from package.json `productName`, so RENAMING THE APP MOVES
 // IT. Every past name must be migrated forward, or the new userData dir comes up empty,
@@ -173,8 +184,8 @@ function startHeartbeat() {
 
   // Pipe all heartbeat output to a log file — critical for debugging
   // because the logger writes to stderr which is normally invisible from Electron
-  try { mkdirSync('C:\\temp', { recursive: true }); } catch {}
-  const logStream = createWriteStream('C:\\temp\\heartbeat.log', { flags: 'a' });
+  try { mkdirSync(RELAY_LOG_DIR, { recursive: true }); } catch {}
+  const logStream = createWriteStream(path.join(RELAY_LOG_DIR, 'heartbeat.log'), { flags: 'a' });
   logStream.write(`\n--- heartbeat started ${new Date().toISOString()} ---\n`);
 
   heartbeatProc = spawn('node', [script], {

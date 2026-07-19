@@ -16,9 +16,10 @@ import os from 'node:os'
 import path from 'node:path'
 import manifest from './manifest.json' with { type: 'json' }
 import { settingsHookStrategy, commandExists, getVersion, RELAY_ROOT } from '../../harness-sdk/index.js'
+import { runtimePath } from '../../paths.js'
 
 const SETTINGS_FILE  = path.join(os.homedir(), '.claude', 'settings.json')
-const ALLOW_ALL_FILE = 'C:\\temp\\relay-allow-all.txt'
+const ALLOW_ALL_FILE = runtimePath('relay-allow-all.txt')
 
 // Identical to the legacy main.js buildHookBlock() — same matchers, same wrapper
 // filenames, resolved against the real relay-deamon1 root in dev and packaged.

@@ -17,10 +17,12 @@
 
 const path = require('path')
 const fs   = require('fs')
+const os   = require('os')
+const { RUNTIME_DIR } = require('./src/paths.cjs')
 
 // Settings.json — Claude Code's config file (hook is added/removed here)
 const SETTINGS_FILE = path.join(
-  process.env.USERPROFILE || process.env.HOME || 'C:\\Users\\lala',
+  os.homedir(),
   '.claude', 'settings.json'
 )
 
@@ -49,7 +51,7 @@ const HOOK_BLOCK = {
 // The hook is the sole gatekeeper; it exits 0 (allow) or 2 (deny) instead.
 const HOOK_TOOLS_ALLOW = ['Bash(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)', 'Read(*)']
 
-const TEMP_DIR       = 'C:\\temp'
+const TEMP_DIR       = RUNTIME_DIR
 const PENDING_DIR    = path.join(TEMP_DIR, 'relay-pending')
 const CURRENT_FILE   = path.join(TEMP_DIR, 'relay-current.txt')
 const ALLOW_ALL_FILE = path.join(TEMP_DIR, 'relay-allow-all.txt')

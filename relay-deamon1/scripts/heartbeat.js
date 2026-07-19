@@ -18,13 +18,17 @@ import { supabase, heartbeat, markOffline, getNextCommand, getPendingFsRequest, 
 import { config }                 from '../src/config.js'
 import { logger }                 from '../src/logger.js'
 import { getAdapter }             from '../src/registry.js'
+import { RUNTIME_DIR, runtimePath, logPath, ensureDirs } from '../src/paths.js'
+import { fileURLToPath }          from 'node:url'
 
-// Append a line to C:\temp\heartbeat.log — always works regardless of how
+const __dir = path.dirname(fileURLToPath(import.meta.url))
+
+// Append a line to the app log dir — always works regardless of how
 // this process was started (manual terminal or spawned from Electron)
 function fileLog(msg) {
   try {
-    fs.mkdirSync('C:\\temp', { recursive: true })
-    fs.appendFileSync('C:\\temp\\heartbeat.log', `[${new Date().toISOString()}] ${msg}\n`)
+    ensureDirs()
+    fs.appendFileSync(logPath('heartbeat.log'), `[${new Date().toISOString()}] ${msg}\n`)
   } catch {}
 }
 
@@ -42,7 +46,7 @@ function fileLog(msg) {
 // stays "busy" regardless of the TTL; only a stuck/failed inject ages out — within 60s
 // instead of minutes. See FAST_PROMPT_DELIVERY_DESIGN.md.
 const BUSY_TTL_MS = 60 * 1000
-function busyFlag(sessionId)  { return `C:\\temp\\relay-busy-${sessionId}.flag` }
+function busyFlag(sessionId)  { return runtimePath(`relay-busy-${sessionId}.flag`) }
 function isBusy(sessionId) {
   if (!sessionId) return false
   try {
@@ -63,7 +67,8 @@ async function tick() {
   } catch (err) {
     logger.warn('Heartbeat failed', { err: err.message })
   }
-  // Keep the OpenCode plugin's credentials in sync with the current machine key.
+  // Keep the OpenCode plugin (file + credentials) in sync with the shipped source.
+  syncOpencodePluginFile()
   syncOpencodePluginEnv()
 }
 
@@ -76,6 +81,32 @@ async function tick() {
 const OC_PLUGIN_DIR = path.join(os.homedir(), '.config', 'opencode', 'plugin')
 const OC_PLUGIN_JS  = path.join(OC_PLUGIN_DIR, 'vibe-relay.js')
 const OC_ENV_FILE   = path.join(OC_PLUGIN_DIR, 'vibe-relay.env.json')
+// The plugin SOURCE that ships with the daemon (bundled + obfuscated in prod). Kept in
+// place by the bundler at src/harnesses/opencode/plugin/relay.js.
+const OC_PLUGIN_SRC = path.join(__dir, '..', 'src', 'harnesses', 'opencode', 'plugin', 'relay.js')
+
+// Self-heal the installed plugin FILE. enable() only copies the plugin when mobile mode
+// is toggled, so after an app update the copy already sitting in OpenCode's dir stays
+// STALE — e.g. it keeps writing PID/busy/ready flags to the OLD path the heartbeat no
+// longer reads, which silently breaks session liveness (a session with no visible chat
+// entry, even though its approval prompt still reaches mobile). Re-copy from the packaged
+// source whenever the installed copy differs. Only refresh an already-installed plugin —
+// creating it from scratch remains enable()'s job.
+function syncOpencodePluginFile() {
+  try {
+    if (!fs.existsSync(OC_PLUGIN_JS)) return       // not installed → leave to enable()
+    let src
+    try { src = fs.readFileSync(OC_PLUGIN_SRC, 'utf8') } catch { return }  // no source to copy
+    let dst = null
+    try { dst = fs.readFileSync(OC_PLUGIN_JS, 'utf8') } catch {}
+    if (src !== dst) {
+      fs.writeFileSync(OC_PLUGIN_JS, src)
+      fileLog('refreshed stale OpenCode plugin file from packaged source')
+    }
+  } catch (err) {
+    fileLog(`syncOpencodePluginFile failed: ${err.message}`)
+  }
+}
 
 function syncOpencodePluginEnv() {
   try {
@@ -114,7 +145,7 @@ function syncOpencodePluginEnv() {
 // but owned by another user (still "alive" for our purposes).
 function isSessionProcessAlive(sessionId) {
   if (!sessionId || process.platform !== 'win32') return false
-  const pidFile = `C:\\temp\\relay-pid-${sessionId}.txt`
+  const pidFile = runtimePath(`relay-pid-${sessionId}.txt`)
   try {
     if (!fs.existsSync(pidFile)) return false
     const pid = parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10)
@@ -154,7 +185,7 @@ async function drainQueue(sessionId) {
       // the FIRST tool call of THIS new prompt would otherwise consume it and kill the prompt
       // on arrival. We only reach here once the previous turn is over (!isBusy), so any
       // surviving flag is guaranteed stale. Mirrors stopHook.js's own orphan cleanup.
-      try { fs.unlinkSync(`C:\\temp\\relay-stop-${cmd.sessionId}.flag`) } catch {}
+      try { fs.unlinkSync(runtimePath(`relay-stop-${cmd.sessionId}.flag`)) } catch {}
       const injected = await tryInjectIntoExistingTerminal(cmd.sessionId, cmd.prompt)
       if (injected) {
         fileLog(`prompt injected into existing ${harness} terminal`)
@@ -272,7 +303,7 @@ async function handleStopRequest(sessionId, harness) {
 // Drop the flag the Claude hooks consume to halt the turn (see hook.js / postHook.js).
 function writeStopFlag(sessionId) {
   if (!sessionId) return
-  try { fs.writeFileSync(`C:\\temp\\relay-stop-${sessionId}.flag`, String(Date.now())) } catch {}
+  try { fs.writeFileSync(runtimePath(`relay-stop-${sessionId}.flag`), String(Date.now())) } catch {}
 }
 
 // Backstop poll — covers a missed stop_requested broadcast. Unscoped: one call
@@ -313,7 +344,7 @@ function harnessRunCommand(harness, sessionId, promptVar) {
 async function tryInjectIntoExistingTerminal(sessionId, prompt) {
   if (process.platform !== 'win32' || !sessionId) return false
 
-  const pidFile = `C:\\temp\\relay-pid-${sessionId}.txt`
+  const pidFile = runtimePath(`relay-pid-${sessionId}.txt`)
   if (!fs.existsSync(pidFile)) {
     fileLog(`no PID file for session ${sessionId}`)
     return false
@@ -325,7 +356,7 @@ async function tryInjectIntoExistingTerminal(sessionId, prompt) {
     return false
   }
 
-  const tmpDir    = process.env.TEMP || 'C:\\temp'
+  const tmpDir    = process.env.TEMP || os.tmpdir()
   const tmpScript = path.join(tmpDir, `inject-${Date.now()}.ps1`)
 
   // The PS1 script is built as a JS template literal. Note:
@@ -334,7 +365,7 @@ async function tryInjectIntoExistingTerminal(sessionId, prompt) {
   //   $($expr)   → PowerShell expression substitution, passed through verbatim
   //   \\         → single backslash in the output file (for path escaping in C#)
   const ps1 = `
-$log = "C:\\temp\\inject-log.txt"
+$log = "${logPath('inject-log.txt')}"
 function L([string]$m) {
     try { Add-Content -Path $log -Value ((Get-Date).ToString("HH:mm:ss") + " " + $m) } catch {}
 }
@@ -473,7 +504,7 @@ exit 0
       shell: false,
     })
     child.on('close', code => {
-      fileLog(`injection exit code=${code}  (see C:\\temp\\inject-log.txt for details)`)
+      fileLog(`injection exit code=${code}  (see ${logPath('inject-log.txt')} for details)`)
       resolve(code === 0)
     })
     child.on('error', err => {
@@ -493,16 +524,16 @@ exit 0
 async function sendInterruptKey(sessionId) {
   if (process.platform !== 'win32' || !sessionId) return false
 
-  const pidFile = `C:\\temp\\relay-pid-${sessionId}.txt`
+  const pidFile = runtimePath(`relay-pid-${sessionId}.txt`)
   if (!fs.existsSync(pidFile)) { fileLog(`no PID file for session ${sessionId} (interrupt)`); return false }
   const claudePid = parseInt(fs.readFileSync(pidFile, 'utf8').trim())
   if (!claudePid || isNaN(claudePid)) { fileLog(`invalid PID for interrupt: ${claudePid}`); return false }
 
-  const tmpDir    = process.env.TEMP || 'C:\\temp'
+  const tmpDir    = process.env.TEMP || os.tmpdir()
   const tmpScript = path.join(tmpDir, `interrupt-${Date.now()}.ps1`)
 
   const ps1 = `
-$log = "C:\\temp\\inject-log.txt"
+$log = "${logPath('inject-log.txt')}"
 function L([string]$m) {
     try { Add-Content -Path $log -Value ((Get-Date).ToString("HH:mm:ss") + " [interrupt] " + $m) } catch {}
 }
@@ -624,7 +655,7 @@ exit 0
       shell: false,
     })
     child.on('close', code => {
-      fileLog(`interrupt exit code=${code}  (see C:\\temp\\inject-log.txt for details)`)
+      fileLog(`interrupt exit code=${code}  (see ${logPath('inject-log.txt')} for details)`)
       resolve(code === 0)
     })
     child.on('error', err => {
@@ -637,7 +668,7 @@ exit 0
 // ── Open a new visible terminal window running the harness with the prompt ────
 function openNewTerminalWindow(cmd, spawnCwd, harness = 'claude-code') {
   if (process.platform === 'win32') {
-    const tmpDir    = process.env.TEMP || 'C:\\temp'
+    const tmpDir    = process.env.TEMP || os.tmpdir()
     const tmpScript = path.join(tmpDir, `vibe-relay-${Date.now()}.ps1`)
     // Prompt goes into the PowerShell here-string $p; the run command references $p
     const runCmd = harnessRunCommand(harness, cmd.sessionId, '$p')
@@ -737,7 +768,7 @@ async function checkFsRequests() {
 // calls) as `output` terminal_events. Tool uses/results are skipped — hooks already capture
 // those. Output is what the user sees Claude "monologuing" in their CLI between tool calls.
 
-const TRANSCRIPT_MAPPING_DIR = 'C:\\temp\\transcript-paths'
+const TRANSCRIPT_MAPPING_DIR = runtimePath('transcript-paths')
 const STALE_MAPPING_MS       = 5 * 60 * 1000           // mappings older than 5m → assume hook is off
 const transcriptPositions    = new Map()               // sessionId → byte offset
 
@@ -845,7 +876,7 @@ async function checkTranscripts() {
 // cli_alive=false so the mobile app can block prompting a closed CLI.
 async function reportSessionLiveness() {
   if (process.platform !== 'win32') return
-  const dir = 'C:\\temp'
+  const dir = RUNTIME_DIR
   let files
   try { files = fs.readdirSync(dir) } catch { return }
 
@@ -919,11 +950,11 @@ function subscribeCommandNudge() {
 // session, so a prompt sent mid-turn lands within ~1s of the turn finishing.
 function checkReadyFlags() {
   let files
-  try { files = fs.readdirSync('C:\\temp') } catch { return }
+  try { files = fs.readdirSync(RUNTIME_DIR) } catch { return }
   for (const f of files) {
     const m = /^relay-ready-(.+)\.flag$/.exec(f)
     if (!m) continue
-    try { fs.unlinkSync(path.join('C:\\temp', f)) } catch {}
+    try { fs.unlinkSync(path.join(RUNTIME_DIR, f)) } catch {}
     const sid = m[1]
     clearBusy(sid)
     fileLog(`turn-end ready flag for ${sid} — draining`)
@@ -939,7 +970,7 @@ function checkReadyFlags() {
 // back to an unscoped claim (for the rare session-less prompt).
 function drainBackstop() {
   let files
-  try { files = fs.readdirSync('C:\\temp') } catch { files = [] }
+  try { files = fs.readdirSync(RUNTIME_DIR) } catch { files = [] }
   let anyLive = false
   for (const f of files) {
     const m = /^relay-pid-(.+)\.txt$/.exec(f)
@@ -961,7 +992,7 @@ function drainBackstop() {
 // 'active' for the whole turn — the mobile lock and the desktop busy-gate now agree.
 function keepActiveTurnsAlive() {
   let files
-  try { files = fs.readdirSync('C:\\temp') } catch { return }
+  try { files = fs.readdirSync(RUNTIME_DIR) } catch { return }
   for (const f of files) {
     const m = /^relay-busy-(.+)\.flag$/.exec(f)
     if (!m) continue
@@ -987,6 +1018,7 @@ process.on('SIGTERM', shutdown)
 
 logger.info('Heartbeat started', { machine: config.machineId })
 
+syncOpencodePluginFile()  // refresh a stale installed plugin immediately on launch
 syncOpencodePluginEnv()   // sync immediately on launch
 tick()
 reportSessionLiveness()

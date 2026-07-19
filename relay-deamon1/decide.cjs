@@ -15,8 +15,9 @@
 const { createClient } = require('@supabase/supabase-js')
 const path = require('path')
 const fs   = require('fs')
+const { runtimePath } = require('./src/paths.cjs')
 
-const PENDING_DIR = 'C:\\temp\\relay-pending'
+const PENDING_DIR = runtimePath('relay-pending')
 
 // ── Load .env ─────────────────────────────────────────────────────────────────
 function loadEnv() {

@@ -15,8 +15,9 @@
 import { postTerminalEvent } from './src/supabase.js'
 import { mkdirSync, writeFileSync, existsSync, unlinkSync } from 'fs'
 import { join } from 'path'
+import { runtimePath } from './src/paths.js'
 
-const TRANSCRIPT_DIR = 'C:\\temp\\transcript-paths'
+const TRANSCRIPT_DIR = runtimePath('transcript-paths')
 function recordTranscriptPath(sessionId, transcriptPath) {
   if (!sessionId || !transcriptPath) return
   try {
@@ -32,7 +33,7 @@ function recordTranscriptPath(sessionId, transcriptPath) {
 //
 // PostToolUse can't block the tool (it already ran), but `continue: false` is honoured
 // on every hook event and halts Claude outright. See STOP_AGENT_DESIGN.md.
-const stopFlag = (sessionId) => `C:\\temp\\relay-stop-${sessionId}.flag`
+const stopFlag = (sessionId) => runtimePath(`relay-stop-${sessionId}.flag`)
 
 function stopRequested(sessionId) {
   if (!sessionId) return false
@@ -105,7 +106,7 @@ async function main() {
   // model produce another round of output first.
   if (stopRequested(session_id)) {
     if (session_id) {
-      try { unlinkSync(`C:\\temp\\relay-busy-${session_id}.flag`) } catch {}
+      try { unlinkSync(runtimePath(`relay-busy-${session_id}.flag`)) } catch {}
     }
     // Emit a `stop` (turn-end) event so the mobile feed unlocks the composer the instant the
     // turn halts — the phone keys off this reliable feed broadcast, not the laggy sessions

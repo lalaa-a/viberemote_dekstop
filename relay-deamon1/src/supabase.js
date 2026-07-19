@@ -183,8 +183,9 @@ export function waitForDecision(requestId) {
 //   { timeout: true }            — no answer within config.timeoutMs
 import { existsSync, mkdirSync, readFileSync, unlinkSync } from 'fs'
 import { join }                                            from 'path'
+import { runtimePath }                                     from './paths.js'
 
-const QUESTION_PENDING_DIR = 'C:\\temp\\relay-pending'
+const QUESTION_PENDING_DIR = runtimePath('relay-pending')
 
 export function waitForAnswer(requestId) {
   return new Promise((resolve) => {

@@ -26,14 +26,15 @@ import { preFilter }                                         from './src/filter.
 import { uploadRequest, waitForDecision, waitForAnswer, markDecided,
          agentPing, postTerminalEvent }                      from './src/supabase.js'
 import { logger }                                            from './src/logger.js'
+import { runtimePath, logPath, ensureDirs }                 from './src/paths.js'
 
 const __dir     = dirname(fileURLToPath(import.meta.url))
 const relayPath = join(__dir, 'relay.cjs').replace(/\\/g, '/')
 
-const PENDING_DIR      = 'C:\\temp\\relay-pending'
-const CURRENT_FILE     = 'C:\\temp\\relay-current.txt'
-const ALLOW_ALL_FILE   = 'C:\\temp\\relay-allow-all.txt'
-const TRANSCRIPT_DIR   = 'C:\\temp\\transcript-paths'
+const PENDING_DIR      = runtimePath('relay-pending')
+const CURRENT_FILE     = runtimePath('relay-current.txt')
+const ALLOW_ALL_FILE   = runtimePath('relay-allow-all.txt')
+const TRANSCRIPT_DIR   = runtimePath('transcript-paths')
 
 // ── Stop (interrupt the turn) ─────────────────────────────────────────────────
 // Claude Code exposes NO external interrupt API, and OS keystroke injection (ESC via
@@ -46,7 +47,7 @@ const TRANSCRIPT_DIR   = 'C:\\temp\\transcript-paths'
 // on stdout and exits 0 halts Claude entirely — this takes precedence over
 // permissionDecision and ends the turn. The heartbeat drops a flag file when the phone
 // requests a stop; we consume it here, on the next tool call. See STOP_AGENT_DESIGN.md.
-const stopFlag = (sessionId) => `C:\\temp\\relay-stop-${sessionId}.flag`
+const stopFlag = (sessionId) => runtimePath(`relay-stop-${sessionId}.flag`)
 
 function stopRequested(sessionId) {
   if (!sessionId) return false
@@ -64,7 +65,7 @@ function haltExit(sessionId, reason) {
   // a halted turn, and a stale busy flag locks the session out of every future prompt
   // until its 60s TTL expires.
   if (sessionId) {
-    try { unlinkSync(`C:\\temp\\relay-busy-${sessionId}.flag`) } catch {}
+    try { unlinkSync(runtimePath(`relay-busy-${sessionId}.flag`)) } catch {}
   }
   process.stdout.write(JSON.stringify({ continue: false, stopReason: reason }))
   process.exit(0)
@@ -85,8 +86,8 @@ function recordTranscriptPath(sessionId, transcriptPath) {
 
 function debugLog(msg) {
   try {
-    mkdirSync('C:\\temp', { recursive: true })
-    appendFileSync('C:\\temp\\hook-debug.log', `[${new Date().toISOString()}] ${msg}\n`)
+    ensureDirs()
+    appendFileSync(logPath('hook-debug.log'), `[${new Date().toISOString()}] ${msg}\n`)
   } catch {}
 }
 
@@ -136,8 +137,8 @@ Write-Output $result
 function storeClaudePid(sessionId) {
   if (!sessionId) return
   try {
-    mkdirSync('C:\\temp', { recursive: true })
-    const pidFile = `C:\\temp\\relay-pid-${sessionId}.txt`
+    ensureDirs()
+    const pidFile = runtimePath(`relay-pid-${sessionId}.txt`)
 
     if (existsSync(pidFile)) {
       const stored = parseInt(readFileSync(pidFile, 'utf8').trim(), 10)
@@ -221,11 +222,11 @@ async function handleQuestion(event){
 
   const requestId = randomUUID()
   try {
-    mkdirSync('C:\\temp', { recursive: true })
+    ensureDirs()
     writeFileSync(CURRENT_FILE, requestId, 'utf8') //lets relay.cjs answer by index
     // Persist the options so `relay.cjs answer <n>` can map an index → label locally.
     writeFileSync(
-      join('C:\\temp', 'relay-current-question.json'),
+      runtimePath('relay-current-question.json'),
       JSON.stringify({ requestId, questions }),
       'utf8',
     )
@@ -338,7 +339,7 @@ async function main() {
   // Mark this session busy (a turn is in flight) so the heartbeat won't inject a queued
   // mobile prompt mid-turn. The Stop hook clears it. See FAST_PROMPT_DELIVERY_DESIGN.md.
   if (event.session_id) {
-    try { writeFileSync(`C:\\temp\\relay-busy-${event.session_id}.flag`, String(Date.now())) } catch {}
+    try { writeFileSync(runtimePath(`relay-busy-${event.session_id}.flag`), String(Date.now())) } catch {}
   }
 
   // Did the phone hit Stop? Check BEFORE the question branch and before any upload, so a
@@ -408,7 +409,7 @@ async function main() {
 
   // Store current ID so relay.cjs 1/2/3 needs no UUID
   try {
-    mkdirSync('C:\\temp', { recursive: true })
+    ensureDirs()
     writeFileSync(CURRENT_FILE, requestId, 'utf8')
   } catch {}
 
@@ -516,8 +517,8 @@ function answerExit(reason) {
 
 main().catch(err => {
   try {
-    mkdirSync('C:\\temp', { recursive: true })
-    appendFileSync('C:\\temp\\hook-debug.log', `[${new Date().toISOString()}] CRASH: ${err.message}\n${err.stack}\n`)
+    ensureDirs()
+    appendFileSync(logPath('hook-debug.log'), `[${new Date().toISOString()}] CRASH: ${err.message}\n${err.stack}\n`)
   } catch {}
   process.exit(0)
 })

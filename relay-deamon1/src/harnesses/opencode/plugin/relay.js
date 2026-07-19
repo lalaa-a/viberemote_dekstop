@@ -128,7 +128,17 @@ function dbg(msg) {
 // THIS terminal (same scheme Claude's hook.js uses). OpenCode is a single binary
 // that owns the console, so process.pid is exactly the process to target. The
 // heartbeat reads C:\temp\relay-pid-<sessionId>.txt and keystroke-injects there.
-const PID_DIR = 'C:\\temp'
+// Runtime dir — MUST match RUNTIME_DIR in relay-deamon1/src/paths.js. This file is
+// copied out to OpenCode's plugin dir, so it can't import paths.js — keep the formula in sync.
+function relayRuntimeDir() {
+  const local = process.platform === 'win32'
+    ? path.join(os.homedir(), 'AppData', 'Local')
+    : process.platform === 'darwin'
+      ? path.join(os.homedir(), 'Library', 'Application Support')
+      : path.join(os.homedir(), '.local', 'share')
+  return path.join(local, 'VibeRemote', 'runtime')
+}
+const PID_DIR = relayRuntimeDir()
 const _pidWritten = new Set()
 function recordPid(sessionId) {
   if (!sessionId || process.platform !== 'win32' || _pidWritten.has(sessionId)) return

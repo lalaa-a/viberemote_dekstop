@@ -2,6 +2,8 @@ const { FusesPlugin } = require('@electron-forge/plugin-fuses');
 const { FuseV1Options, FuseVersion } = require('@electron/fuses');
 const fs = require('fs');
 const path = require('path');
+const { bundleRelayDir } = require('./forge/bundleRelay.cjs');
+const { obfuscateRelayDir } = require('./forge/obfuscateRelay.cjs');
 
 module.exports = {
   packagerConfig: {
@@ -71,6 +73,18 @@ module.exports = {
         for (const dir of ['build', 'src', 'deps', 'scripts', 'typings', 'third_party']) {
           try { fs.rmSync(path.join(nodeptyPath, dir), { recursive: true, force: true }); } catch {}
         }
+
+        // 5. Bundle relay-deamon1's src/ tree into sealed, self-contained entry
+        //    files (Option A). Collapses ~18 readable modules into their entry
+        //    points; the depth-sensitive shared modules (registry/machineEnv/
+        //    env/index) are kept as files and referenced externally. node_modules
+        //    is left intact (npm deps are marked external). See forge/bundleRelay.cjs.
+        await bundleRelayDir(relayPath);
+
+        // 6. Obfuscate the resulting bundles + kept external modules. Runs LAST,
+        //    so only the files that actually ship get scrambled. node_modules is
+        //    skipped inside the helper. Source in git stays clean.
+        obfuscateRelayDir(relayPath);
       }
     },
   },
