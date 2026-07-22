@@ -50,6 +50,10 @@ const strategy = settingsHookStrategy({
   buildHookBlock,
   allowList:     HOOK_TOOLS_ALLOW,
   allowAllFile:  ALLOW_ALL_FILE,
+  // Live token-usage: register our statusLine so it pokes the heartbeat at Claude's refresh
+  // cadence (see LIVE_TOKEN_STATUSLINE_DESIGN.md). Backs up / restores any user statusLine.
+  statusLineCommand:    wrap('statusLine.cjs'),
+  statusLineBackupFile: runtimePath('statusline-backup.json'),
 })
 
 export default {

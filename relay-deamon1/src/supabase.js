@@ -48,6 +48,14 @@ export async function agentTouch(sessionId) {
   return apiPost('/relay/agent-touch', { sessionId })
 }
 
+// ── Live token usage for the current turn ─────────────────────────────────────
+// Absolute running totals (never deltas) so a dropped POST/broadcast self-heals on the
+// next one. The server persists them on the agent row and broadcasts a 'usage' event for
+// the mobile compose-bar counter. See TOKEN_USAGE_STREAMING_DESIGN.md.
+export async function postUsage(usage) {
+  return apiPost('/relay/usage', usage)
+}
+
 // ── Fetch next pending mobile command (idle-gated on server) ─────────────────
 // Pass a sessionId to scope the claim to that session — the desktop does this when it
 // knows that CLI is idle. command/next atomically marks the row delivered, so we must
@@ -107,8 +115,44 @@ export async function markOffline() {
 }
 
 // ── Post a terminal lifecycle event (tool_start/tool_end/notification/stop) ──
-export async function postTerminalEvent({ session_id, event_type, tool_name, summary, detail, status }) {
-  return apiPost('/relay/terminal-event', { session_id, event_type, tool_name, summary, detail, status })
+// A turn-end `stop` is the ONE event the mobile can't recover on its own — if it's lost (the
+// desktop was offline at the instant the turn ended) the phone is stuck showing "working". So
+// when a `stop` POST fails, we persist it to a local queue and the heartbeat re-sends it on
+// reconnect (STALE_WORKING_ON_DISCONNECT_DESIGN.md §3-C). Other event types are transient and
+// not worth queueing. writeFileSync is synchronous so the queue survives even if the calling
+// process (a short-lived Claude hook) exits immediately after.
+const PENDING_DIR = () => runtimePath('pending-events')
+
+export async function postTerminalEvent(payload) {
+  try {
+    return await apiPost('/relay/terminal-event', payload)
+  } catch (err) {
+    if (payload?.event_type === 'stop') {
+      try {
+        mkdirSync(PENDING_DIR(), { recursive: true })
+        writeFileSync(join(PENDING_DIR(), `${randomUUID()}.json`), JSON.stringify(payload))
+      } catch {}
+    }
+    throw err
+  }
+}
+
+// Re-send any queued turn-end events. Called by the heartbeat on a timer; a delivered event is
+// removed, a still-failing one is left for the next flush.
+export async function flushPendingEvents() {
+  let files
+  try { files = readdirSync(PENDING_DIR()) } catch { return }
+  for (const f of files) {
+    if (!f.endsWith('.json')) continue
+    const full = join(PENDING_DIR(), f)
+    let payload
+    try { payload = JSON.parse(readFileSync(full, 'utf8')) }
+    catch { try { unlinkSync(full) } catch {}; continue }      // corrupt → drop
+    try {
+      await apiPost('/relay/terminal-event', payload)
+      try { unlinkSync(full) } catch {}                        // delivered
+    } catch { /* still offline — keep it for the next flush */ }
+  }
 }
 
 // ── Block until someone approves / denies, or timeout ────────────────────────
@@ -181,8 +225,9 @@ export function waitForDecision(requestId) {
 // drops a local signal file (relay.cjs answer <n>). Returns:
 //   { selected_options: [...] }  — the picked option(s)
 //   { timeout: true }            — no answer within config.timeoutMs
-import { existsSync, mkdirSync, readFileSync, unlinkSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync, readdirSync } from 'fs'
 import { join }                                            from 'path'
+import { randomUUID }                                      from 'crypto'
 import { runtimePath }                                     from './paths.js'
 
 const QUESTION_PENDING_DIR = runtimePath('relay-pending')

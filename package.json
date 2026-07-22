@@ -1,8 +1,8 @@
 {
   "name": "vibe-remote",
   "productName": "VibeRemote",
-  "version": "1.5.3",
-  "description": "Multi device pairable feature added",
+  "version": "1.6.0",
+  "description": "testing version",
   "main": ".vite/build/main.js",
   "private": true,
   "scripts": {
@@ -16,7 +16,7 @@
   },
   "keywords": [],
   "author": {
-    "name": "lala",
+    "name": "spiralware",
     "email": "lwravishan@gmail.com"
   },
   "license": "MIT",

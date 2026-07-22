@@ -127,7 +127,7 @@ function dbg(msg) {
 // ── Record this OpenCode process's PID so the heartbeat can inject prompts into
 // THIS terminal (same scheme Claude's hook.js uses). OpenCode is a single binary
 // that owns the console, so process.pid is exactly the process to target. The
-// heartbeat reads C:\temp\relay-pid-<sessionId>.txt and keystroke-injects there.
+// heartbeat reads <runtime>/relay-pid-<sessionId>.txt (runtime dir below) and injects there.
 // Runtime dir — MUST match RUNTIME_DIR in relay-deamon1/src/paths.js. This file is
 // copied out to OpenCode's plugin dir, so it can't import paths.js — keep the formula in sync.
 function relayRuntimeDir() {
@@ -229,6 +229,40 @@ async function postTerminalEvent(e, payload) {
   } catch (err) {
     dbg(`POST terminal-event FAILED: ${err.message}`)
   }
+}
+
+// ── Live token usage (TOKEN_USAGE_STREAMING_DESIGN.md) ────────────────────────
+async function postUsage(e, payload) {
+  if (!e.apiUrl) return
+  try {
+    await fetch(`${e.apiUrl}/relay/usage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-machine-api-key': e.machineApiKey },
+      body: JSON.stringify(payload),
+    })
+  } catch (err) { dbg(`POST usage FAILED: ${err.message}`) }
+}
+
+// Per-session token accumulator. OpenCode makes several assistant messages per turn (tool
+// loops); we key by message id and sum their outputs for the turn total. Reset on session.idle.
+const ocUsage = new Map()   // sessionId → { byMsg: Map<msgId,{input,output}>, lastPostAt }
+function ocUsageState(sid) {
+  let st = ocUsage.get(sid)
+  if (!st) { st = { byMsg: new Map(), lastPostAt: 0 }; ocUsage.set(sid, st) }
+  return st
+}
+// Pull token counts + session id off a message-updated event, tolerating shape differences
+// across SDK versions. Returns null if this isn't an assistant message with usage.
+function readOcUsage(event) {
+  const info = event?.properties?.info || event?.properties?.message
+  const t    = info?.tokens
+  if (!info || !t) return null
+  const sid = info.sessionID || info.session_id || info.sessionId
+  const mid = info.id
+  if (!sid || !mid) return null
+  const input  = (t.input  || 0) + (t.cache?.read || 0) + (t.cache?.write || 0)
+  const output = (t.output || 0) + (t.reasoning || 0)
+  return { sid, mid, input, output }
 }
 
 // Track text/reasoning parts we've already posted (keyed by part id) so the
@@ -548,6 +582,27 @@ export const VibeRelay = async ({ project, directory, serverUrl, client } = {}) 
                 status:     'success',
               })
             }
+          }
+        }
+        if (sid) ocUsage.delete(sid)   // reset the per-turn token counter for the next turn
+        return
+      }
+
+      // Live token usage → mobile compose-bar counter. OpenCode updates the assistant message
+      // (carrying cumulative tokens) as it generates; accumulate per message id and push the
+      // turn total, throttled to ≤1/s. Reset on session.idle above. See TOKEN_USAGE design doc.
+      if (event?.type === 'message.updated') {
+        const u = readOcUsage(event)
+        if (u) {
+          const st = ocUsageState(u.sid)
+          st.byMsg.set(u.mid, { input: u.input, output: u.output })
+          let turnOutput = 0
+          for (const v of st.byMsg.values()) turnOutput += v.output
+          const now = Date.now()
+          if (now - st.lastPostAt >= 1000) {
+            st.lastPostAt = now
+            const e = env()
+            if (e.apiUrl) postUsage(e, { sessionId: u.sid, turnInput: u.input, turnOutput })
           }
         }
         return

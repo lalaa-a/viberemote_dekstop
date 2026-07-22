@@ -547,7 +547,11 @@ body {
 }
 
 .paired-icon {
-  font-size: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* The glyph strokes with currentColor, so this sets the icon colour. */
+  color: var(--text);
 }
 
 .paired-name {

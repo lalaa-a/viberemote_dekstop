@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY, API_URL } from '../lib/supabase.js';
 import vibeRemoteLogo from '../assets/logo/vibeRemote_logo.svg';
+import phoneIcon from '../assets/icons/smartphone.svg';
 
 async function sha256hex(text) {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
@@ -16,6 +17,11 @@ function machineHeaders(apiKey) {
 
 function LogoMark() {
   return <img src={vibeRemoteLogo} width="26" height="26" alt="" />;
+}
+
+// Paired-device glyph — same stroke style as HarnessGlyph.
+function PhoneGlyph() {
+  return <img src={phoneIcon} width="26" height="26" style={{ filter: 'brightness(0) invert(1)' }} alt="" />;
 }
 
 // Per-harness glyph, drawn dark on the green bubble.
@@ -301,7 +307,7 @@ export default function Dashboard() {
           {pairing && !pairing.paired && (
             <>
               {pairing._error && (
-                <p className="card-sub" style={{ color: 'var(--error)' }}>Pairing check failed — {pairing._error}</p>
+                <p className="card-sub" style={{ color: 'var(--error)' }}>Pairing check failed Network Error — {pairing._error}</p>
               )}
               <p className="card-sub">Scan this QR code with the VibeRemote app to connect your phone.</p>
               <div className="qr-wrap">
@@ -319,7 +325,7 @@ export default function Dashboard() {
           {pairing && pairing.paired && (
             <div className="paired-device">
               <div className="paired-info">
-                <span className="paired-icon">📱</span>
+                <span className="paired-icon"><PhoneGlyph /></span>
                 <div>
                   <p className="paired-name">{pairing.device?.device_name ?? 'Phone'}</p>
                   <p className="paired-meta">

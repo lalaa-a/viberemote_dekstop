@@ -14,7 +14,7 @@ import { spawn }                  from 'child_process'
 import fs                         from 'fs'
 import path                       from 'path'
 import os                         from 'os'
-import { supabase, heartbeat, markOffline, getNextCommand, getPendingFsRequest, respondFsRequest, postTerminalEvent, reportSessionsAlive, pollStopRequests, ackStopRequests, agentTouch } from '../src/supabase.js'
+import { supabase, heartbeat, markOffline, getNextCommand, getPendingFsRequest, respondFsRequest, postTerminalEvent, reportSessionsAlive, pollStopRequests, ackStopRequests, agentTouch, postUsage, flushPendingEvents } from '../src/supabase.js'
 import { config }                 from '../src/config.js'
 import { logger }                 from '../src/logger.js'
 import { getAdapter }             from '../src/registry.js'
@@ -138,7 +138,7 @@ function syncOpencodePluginEnv() {
 
 // Is the harness CLI for this session STILL OPEN?
 // Both Claude (hook.js) and OpenCode (relay plugin) write the live console PID to
-// C:\temp\relay-pid-<sessionId>.txt while running. We verify that PID is alive:
+// <runtime>/relay-pid-<sessionId>.txt while running (runtime dir = src/paths.js). We verify it:
 //   • alive  → the CLI window is still open → inject the prompt into it
 //   • dead/missing → the user closed the CLI → resume the session in a new window
 // `session.kill(pid, 0)` throws ESRCH if the process is gone, EPERM if it is alive
@@ -339,7 +339,7 @@ function harnessRunCommand(harness, sessionId, promptVar) {
 //   2. Clipboard + focus + paste shortcut — fallback for ConPTY-based terminals
 //      (Windows Terminal). Uses Ctrl+Shift+V because that's WT's default paste.
 //
-// All steps log to C:\temp\inject-log.txt so the user can see exactly which
+// All steps log to inject-log.txt (in the logs dir, src/paths.js) so the user can see which
 // stage succeeded or failed.
 async function tryInjectIntoExistingTerminal(sessionId, prompt) {
   if (process.platform !== 'win32' || !sessionId) return false
@@ -760,8 +760,8 @@ async function checkFsRequests() {
 // ── Transcript watcher (3s) ───────────────────────────────────────────────────
 // Claude Code writes a JSONL transcript for each session at
 //   ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
-// Each hook fire updates C:\temp\transcript-paths\<session-id>.path with the path,
-// so we know which transcripts belong to active interception sessions on this machine.
+// Each hook fire updates <runtime>/transcript-paths/<session-id>.path with the path (runtime
+// dir = src/paths.js), so we know which transcripts belong to active sessions on this machine.
 //
 // Each loop tick: read new bytes from each known transcript, parse complete JSON lines,
 // forward any assistant `text` content blocks (Claude's narrative reasoning between tool
@@ -771,6 +771,15 @@ async function checkFsRequests() {
 const TRANSCRIPT_MAPPING_DIR = runtimePath('transcript-paths')
 const STALE_MAPPING_MS       = 5 * 60 * 1000           // mappings older than 5m → assume hook is off
 const transcriptPositions    = new Map()               // sessionId → byte offset
+
+// Per-session token accumulators for the live compose-bar counter (TOKEN_USAGE_STREAMING_DESIGN.md).
+// turn* reset each turn (a genuine user prompt); session* are monotonic. We send ABSOLUTE totals.
+const usageBySession = new Map()   // sessionId → { turnInput, turnOutput, sessionInput, sessionOutput, seq }
+function getUsageAcc(sessionId) {
+  let acc = usageBySession.get(sessionId)
+  if (!acc) { acc = { turnInput: 0, turnOutput: 0, sessionInput: 0, sessionOutput: 0, seq: 0 }; usageBySession.set(sessionId, acc) }
+  return acc
+}
 
 function listTranscriptMappings() {
   try {
@@ -824,12 +833,40 @@ async function tailOneTranscript(sessionId, mappingFile) {
 
   const lines = text.slice(0, lastNewline).split('\n').filter(l => l.trim())
   let forwardedOutput = false
+  let usageChanged    = false
   for (const line of lines) {
     let entry
     try { entry = JSON.parse(line) } catch { continue }
 
+    // Turn boundary: a genuine user prompt (NOT a tool_result, which is also type 'user')
+    // starts a new turn → reset the per-turn token counters so mobile shows THIS turn.
+    if (entry.type === 'user') {
+      const content = entry.message?.content
+      const isToolResult = Array.isArray(content) && content.some(b => b?.type === 'tool_result')
+      if (!isToolResult) {
+        const acc = getUsageAcc(sessionId)
+        acc.turnInput = 0; acc.turnOutput = 0; acc.seq++
+        usageChanged = true
+      }
+      continue
+    }
+
     // Only forward assistant narrative text — tool_use/tool_result are already covered by hooks
     if (entry.type !== 'assistant' || !entry.message?.content) continue
+
+    // Accumulate token usage — present on every assistant message (even tool-only ones).
+    // turnInput = latest call's context size (input + cache); turnOutput = cumulative generated
+    // this turn. session* are monotonic (billed input + generated). ABSOLUTE totals.
+    const u = entry.message.usage
+    if (u) {
+      const acc = getUsageAcc(sessionId)
+      acc.turnInput      = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0)
+      acc.turnOutput    += (u.output_tokens || 0)
+      acc.sessionInput  += (u.input_tokens || 0)
+      acc.sessionOutput += (u.output_tokens || 0)
+      usageChanged = true
+    }
+
     const blocks = Array.isArray(entry.message.content) ? entry.message.content : []
     for (const block of blocks) {
       if (block.type !== 'text') continue
@@ -845,6 +882,19 @@ async function tailOneTranscript(sessionId, mappingFile) {
         status:     null,
       }).catch(() => {})
     }
+  }
+
+  // Push the current turn's running token totals (absolute; the 3s tailer tick throttles this
+  // to ≤1 POST/session/3s). The server persists them and broadcasts 'usage' for the compose bar.
+  if (usageChanged) {
+    const acc = getUsageAcc(sessionId)
+    postUsage({
+      sessionId,
+      turnInput:     acc.turnInput,
+      turnOutput:    acc.turnOutput,
+      sessionInput:  acc.sessionInput,
+      sessionOutput: acc.sessionOutput,
+    }).catch(() => {})
   }
 
   // Fresh reasoning just streamed → keep an IN-FLIGHT turn active: refresh last_activity_at
@@ -869,6 +919,29 @@ async function checkTranscripts() {
   }
 }
 
+// ── Usage poke (1s) ───────────────────────────────────────────────────────────
+// Claude Code's statusLine command (statusLine.cjs) writes <runtime>/usage-<sid>.json on
+// every refresh — i.e. at Claude's OWN cadence, around each model response. When one changes,
+// re-read that session's transcript immediately so the mobile token counter updates at
+// Claude's pace instead of waiting up to 3s for checkTranscripts. tailOneTranscript is
+// idempotent (reads only new bytes, advances the position synchronously), so poke + the 3s
+// tick never double-count. See LIVE_TOKEN_STATUSLINE_DESIGN.md.
+const usagePokeMtimes = new Map()   // sessionId → last-seen mtimeMs of usage-<sid>.json
+function checkUsagePokes() {
+  let files
+  try { files = fs.readdirSync(RUNTIME_DIR) } catch { return }
+  for (const f of files) {
+    const m = /^usage-(.+)\.json$/.exec(f)
+    if (!m) continue
+    const sid = m[1]
+    let st
+    try { st = fs.statSync(path.join(RUNTIME_DIR, f)) } catch { continue }
+    if (usagePokeMtimes.get(sid) === st.mtimeMs) continue   // unchanged since last check
+    usagePokeMtimes.set(sid, st.mtimeMs)
+    tailOneTranscript(sid, runtimePath('transcript-paths', `${sid}.path`)).catch(() => {})
+  }
+}
+
 // ── Session liveness (15s) ────────────────────────────────────────────────────
 // Enumerate the per-session PID files (relay-pid-<sessionId>.txt) written by each
 // harness while running, check which processes are still alive, and report the
@@ -888,8 +961,10 @@ async function reportSessionLiveness() {
     if (isSessionProcessAlive(sessionId)) {
       alive.push(sessionId)
     } else {
-      // Process is gone — drop the stale PID file so it doesn't accumulate.
+      // Process is gone — drop the stale PID file (and its usage poke file) so they don't accumulate.
       try { fs.unlinkSync(path.join(dir, f)) } catch {}
+      try { fs.unlinkSync(runtimePath(`usage-${sessionId}.json`)) } catch {}
+      usagePokeMtimes.delete(sessionId)
     }
   }
 
@@ -1029,6 +1104,8 @@ setInterval(drainBackstop,          3_000)   // backstop only — broadcast + re
 setInterval(checkReadyFlags,        1_000)   // inject queued prompts the instant a turn ends
 setInterval(checkFsRequests,        5_000)
 setInterval(checkTranscripts,       3_000)
+setInterval(checkUsagePokes,        1_000)   // statusLine poke → token counter at Claude's cadence
+setInterval(() => { flushPendingEvents().catch(() => {}) }, 15_000)   // re-send turn-ends missed while offline
 setInterval(keepActiveTurnsAlive,  10_000)   // hold status='active' through long reasoning / long tools
 setInterval(reportSessionLiveness, 15_000)
 setInterval(checkStopRequests,      5_000)   // backstop only — stop_requested broadcast is primary
