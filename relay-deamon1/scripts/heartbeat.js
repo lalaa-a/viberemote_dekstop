@@ -983,10 +983,12 @@ async function reportSessionLiveness() {
 // — we just stop the steady polling. A slow interval below remains as a backstop
 // in case the socket drops. mobile_commands is in the Realtime publication
 // (server migration 005).
+let machineChannel = null   // the machine:<id> channel — also carries our presence (A1)
+
 function subscribeCommandNudge() {
   try {
-    supabase
-      .channel(`machine:${config.machineId}`)
+    machineChannel = supabase
+      .channel(`machine:${config.machineId}`, { config: { presence: { key: config.machineId } } })
       // PRIMARY: broadcast is reliable where postgres_changes is silently dropped on
       // this self-hosted Supabase. The server fires it from POST /mobile/prompt with the
       // sessionId so we can do a scoped, idle-gated claim. See FAST_PROMPT_DELIVERY_DESIGN.md.
@@ -1011,7 +1013,13 @@ function subscribeCommandNudge() {
         handleStopRequest(payload?.sessionId, payload?.harness)
       })
       .subscribe((status) => {
-        if (status === 'SUBSCRIBED') fileLog('command nudge subscribed (broadcast + pg)')
+        if (status === 'SUBSCRIBED') {
+          fileLog('command nudge subscribed (broadcast + pg + presence)')
+          // A1 — announce presence. The mobile watches this channel's presence and flips the
+          // machine OFFLINE the instant our socket drops (kill / network / sleep), instead of
+          // waiting for last_seen to go stale. See INSTANT_OFFLINE_AND_HARNESS_UPDATES.md §3.
+          try { machineChannel.track({ online: true, at: Date.now() }) } catch {}
+        }
       })
   } catch (err) {
     fileLog(`command nudge subscribe failed: ${err.message}`)
@@ -1081,6 +1089,9 @@ function keepActiveTurnsAlive() {
 // ── Shutdown ──────────────────────────────────────────────────────────────────
 
 async function shutdown() {
+  // Untrack presence FIRST — fires an instant `leave` to the mobile (sub-second), before the
+  // durable markOffline. Belt (presence) and suspenders (DB). See INSTANT_OFFLINE…md §3-A3.
+  try { await machineChannel?.untrack() } catch {}
   try { await markOffline() } catch {}
   logger.info('Machine marked offline')
   process.exit(0)
@@ -1099,7 +1110,7 @@ tick()
 reportSessionLiveness()
 subscribeCommandNudge()   // broadcast push for prompt delivery (primary path)
 drainBackstop()           // drain anything already queued at startup (scoped per live session)
-setInterval(tick,                  30_000)
+setInterval(tick,                  15_000)   // machine heartbeat — faster so offline backstop is tighter
 setInterval(drainBackstop,          3_000)   // backstop only — broadcast + ready-flag are primary
 setInterval(checkReadyFlags,        1_000)   // inject queued prompts the instant a turn ends
 setInterval(checkFsRequests,        5_000)

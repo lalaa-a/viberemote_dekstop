@@ -13,6 +13,7 @@
  */
 
 import { postTerminalEvent } from './src/supabase.js'
+import { READONLY_TOOLS } from './src/filter.js'
 import { mkdirSync, writeFileSync, existsSync, unlinkSync } from 'fs'
 import { join } from 'path'
 import { runtimePath } from './src/paths.js'
@@ -70,6 +71,12 @@ async function main() {
   const { session_id, tool_name, tool_input, tool_response, transcript_path } = event
   recordTranscriptPath(session_id, transcript_path)
 
+  // PostToolUse now matches ALL tools (to show results for WebFetch/WebSearch/etc.), but the
+  // read-only tools were auto-allowed with no "tool_start", so posting their "tool_end" would
+  // leave orphan rows in the feed. Skip the result post for them — but still fall through to the
+  // stop check below (a stop can arrive while a read-only tool runs).
+  if (!READONLY_TOOLS.has(tool_name)) {
+
   const isError = (tool_response?.exit_code > 0) || !!tool_response?.error
 
   let summary = ''
@@ -89,6 +96,12 @@ async function main() {
   } else if (tool_name === 'MultiEdit') {
     const count = (tool_input?.edits || []).length
     summary = `MultiEdit ${count} file${count !== 1 ? 's' : ''}`
+  } else if (tool_name === 'WebFetch') {
+    summary = `WebFetch ${tool_input?.url || ''}`.trim()
+  } else if (tool_name === 'WebSearch') {
+    summary = `WebSearch ${tool_input?.query || ''}`.trim()
+  } else if (tool_name === 'Task') {
+    summary = `Task ${tool_input?.description || tool_input?.subagent_type || ''}`.trim()
   } else {
     summary = tool_name || 'Unknown tool'
   }
@@ -101,6 +114,8 @@ async function main() {
     detail,
     status: isError ? 'error' : 'success',
   }).catch(() => {})
+
+  } // end: non-read-only tool result post
 
   // Phone hit Stop while this tool was running → halt now, rather than letting the
   // model produce another round of output first.

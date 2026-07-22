@@ -22,7 +22,9 @@ module.exports = {
       if (filepath.startsWith('/.vite')) return false;  // Vite build output
       return true;                                       // exclude everything else
     },
-    extraResource: ['relay-deamon1'],
+    // relay-deamon1 (the daemon) + the tray icon (src/ is otherwise excluded from packaging;
+    // main.js reads it from resources at runtime via process.resourcesPath).
+    extraResource: ['relay-deamon1', 'src/assets/logo/vibeRemote_icon.png'],
   },
   hooks: {
     postPackage: async (_forgeConfig, options) => {

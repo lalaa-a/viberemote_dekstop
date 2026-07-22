@@ -102,6 +102,52 @@ function formatAnswer(questions, selected_options) {
 
 const GATED = new Set(['bash', 'edit', 'write', 'patch'])
 
+// ── Native-permission ↔ tool-gate dedup ───────────────────────────────────────
+// Two gates can fire for the same call: tool.execute.before (gates the write tools, which are
+// "allow" by default so this is their only gate) and the permission.updated handler (gates
+// whatever OpenCode's config sets to "ask"). In the default config they never overlap. But if a
+// user sets a GATED tool (bash/edit/…) to "ask", BOTH fire — so each stamps a map on approval and
+// the other skips a call it already handled, preventing a double phone prompt (either order).
+const _gatedByTool = new Map()   // `${sessionID}:${tool}` → ts, set by tool.execute.before
+const _gatedByPerm = new Map()   // `${sessionID}:${tool}` → ts, set by permission.updated
+function stampRecent(map, key) { map.set(key, Date.now()) }
+function takeRecent(map, key, ms = 15000) {
+  const ts = map.get(key)
+  if (ts && Date.now() - ts < ms) { map.delete(key); return true }
+  return false
+}
+
+// Respond to an OpenCode permission request: POST /session/{id}/permissions/{permissionID}
+// body { response: 'once' | 'always' | 'reject' }. Mirrors replyNativeQuestion — try the typed
+// client, then a direct HTTP POST (root path, then /api) via the plugin's serverUrl.
+async function respondPermission({ serverUrl, client, sessionID, permissionID, response }) {
+  try {
+    if (client?.postSessionByIdPermissionsByPermissionId) {
+      await client.postSessionByIdPermissionsByPermissionId({ path: { id: sessionID, permissionID }, body: { response } })
+      dbg(`permission replied via client (${response})`)
+      return true
+    }
+  } catch (err) { dbg(`client permission respond failed: ${err.message}`) }
+
+  if (!serverUrl) { dbg('respondPermission: no serverUrl'); return false }
+  const base = String(serverUrl).replace(/\/+$/, '')
+  for (const url of [
+    `${base}/session/${sessionID}/permissions/${permissionID}`,
+    `${base}/api/session/${sessionID}/permissions/${permissionID}`,
+  ]) {
+    try {
+      const res = await fetch(url, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ response }),
+      })
+      dbg(`permission respond POST ${url} → ${res.status}`)
+      if (res.ok) return true
+    } catch (err) { dbg(`permission respond POST ${url} failed: ${err.message}`) }
+  }
+  return false
+}
+
 // Track which sessions we've already pinged so we only do it once per session
 // rather than on every tool call (the ping is just to register the agent row).
 const _pingedSessions = new Set()
@@ -438,6 +484,10 @@ export const VibeRelay = async ({ project, directory, serverUrl, client } = {}) 
       markBusyOC(input.sessionID)            // any tool call → a turn is in flight
       if (!GATED.has(input.tool)) return
 
+      // If OpenCode's permission system already gated this exact call through the phone
+      // (permission.updated handler approved it), don't prompt again.
+      if (takeRecent(_gatedByPerm, `${input.sessionID}:${input.tool}`)) return
+
       const e = env()
       if (!e.apiUrl) return
 
@@ -472,6 +522,9 @@ export const VibeRelay = async ({ project, directory, serverUrl, client } = {}) 
 
       const approved = await uploadAndWait(e, row)
       if (!approved) throw new Error('Denied via Vibe Remote mobile app')
+      // Remember we gated this call so a following permission.updated (if this tool is also
+      // configured "ask") auto-approves instead of prompting the phone a second time.
+      stampRecent(_gatedByTool, `${input.sessionID}:${input.tool}`)
     },
 
     // ── 2. Tool completion ────────────────────────────────────────────────────
@@ -494,6 +547,76 @@ export const VibeRelay = async ({ project, directory, serverUrl, client } = {}) 
     // so each reasoning/response block becomes one chat bubble.
     event: async ({ event }) => {
       if (!fs.existsSync(FLAG_FILE)) return
+
+      // ── NATIVE permission request → mobile ─────────────────────────────────
+      // OpenCode fires `permission.updated` whenever a tool needs approval per the user's
+      // `permission` config — webfetch, websearch, external_directory, or anything set to
+      // "ask". The TUI would prompt locally (the "requires CLI accept" the user saw); instead we
+      // route it to the phone and reply via POST /session/:id/permissions/:permissionID, which is
+      // what actually clears the prompt. Covers EVERY tool OpenCode asks about, not a fixed list.
+      if (event?.type === 'permission.updated' || event?.type === 'permission.asked') {
+        const perm         = event.properties || {}
+        const sessionID    = perm.sessionID
+        const permissionID = perm.id
+        if (!sessionID || !permissionID) { dbg(`permission event missing ids: ${JSON.stringify(perm).slice(0, 200)}`); return }
+        const e = env()
+        if (!e.apiUrl) return
+
+        const permTool = String(perm.type || perm.metadata?.tool || perm.pattern || '').toLowerCase()
+        dbg(`permission.updated tool=${permTool} id=${permissionID} session=${sessionID} title=${perm.title ?? ''}`)
+
+        // The question tool routes its ACTUAL prompt to mobile via the question.asked flow — just
+        // let it run (auto-approve its permission) rather than gating "may I ask a question".
+        if (permTool === 'question') {
+          await respondPermission({ serverUrl, client, sessionID, permissionID, response: 'once' })
+          return
+        }
+
+        // Dedup: a GATED write tool (tool.execute.before) may have just gated this same call.
+        if (takeRecent(_gatedByTool, `${sessionID}:${permTool}`)) {
+          await respondPermission({ serverUrl, client, sessionID, permissionID, response: 'once' })
+          dbg(`permission ${permTool} auto-approved (already gated via tool.execute.before)`)
+          return
+        }
+
+        recordPid(sessionID)
+        agentPing(e, sessionID, directory ?? null)
+
+        const summary = perm.title || (permTool ? `Permission: ${permTool}` : 'Permission request')
+        postTerminalEvent(e, { session_id: sessionID, event_type: 'tool_start', tool_name: permTool || 'permission', summary })
+
+        const row = {
+          id: randomUUID(), harness: 'opencode',
+          user_id: e.userId, machine_id: e.machineId, session_id: sessionID,
+          tool_name: permTool || 'permission',
+          display_type: 'unknown',
+          summary,
+          risk_level: 'medium', risk_reason: 'OpenCode needs permission to continue', risk_icon: '🔶',
+          files_affected: [],
+          raw_input: perm.metadata || null,
+          status: 'pending', created_at: new Date().toISOString(),
+        }
+
+        let approved
+        try { approved = await uploadAndWait(e, row) }
+        catch (err) { dbg(`permission upload failed: ${err.message} — leaving for local TUI`); return }
+
+        // Stamp BEFORE replying so a following tool.execute.before for this call (if the tool is
+        // also gated) sees it and skips a second prompt.
+        if (approved) stampRecent(_gatedByPerm, `${sessionID}:${permTool}`)
+        await respondPermission({ serverUrl, client, sessionID, permissionID, response: approved ? 'once' : 'reject' })
+        // On approval the tool runs and tool.execute.after posts the completion row — don't
+        // duplicate it. On denial the tool never executes (no after-hook), so close the row here.
+        if (!approved) {
+          postTerminalEvent(e, {
+            session_id: sessionID, event_type: 'tool_end',
+            tool_name:  permTool || 'permission',
+            summary:    `Denied: ${summary}`,
+            status:     'error',
+          })
+        }
+        return
+      }
 
       // ── NATIVE question tool → mobile ──────────────────────────────────────
       // OpenCode's built-in `question` tool emits `question.asked` and suspends until

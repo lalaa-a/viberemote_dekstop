@@ -1,5 +1,14 @@
 import { config } from './config.js'
 
+// Pure read-only / no-side-effect tools that Claude Code auto-approves and that fire
+// constantly (search/list). The PreToolUse hook now matches ALL tools so nothing that needs
+// permission can slip through to a manual CLI prompt (WebFetch, WebSearch, Task, MCP tools,
+// future tools) — but these are auto-allowed here so they don't spam the phone with approvals.
+// NOTE: `Read` is intentionally NOT here — it keeps going to mobile like before.
+export const READONLY_TOOLS = new Set([
+  'Glob', 'Grep', 'LS', 'TodoWrite', 'TodoRead', 'NotebookRead', 'BashOutput',
+])
+
 // Returns 'allow' | 'block' | 'ask'
 export function preFilter(toolName, toolInput) {
 
@@ -14,6 +23,11 @@ export function preFilter(toolName, toolInput) {
         }
       } catch {}
     }
+  }
+
+  // ─── Read-only tools → auto-allow (Claude auto-approves these; no mobile decision needed) ──
+  if (READONLY_TOOLS.has(toolName)) {
+    return { action: 'allow', reason: 'read-only tool (auto-approved)' }
   }
 
   // ─── Always allow list ────────────────────────────────────────────────────

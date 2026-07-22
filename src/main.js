@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain } from 'electron';
+import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage } from 'electron';
 import path from 'node:path';
 import { spawn, execFile } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdirSync, createWriteStream } from 'node:fs';
@@ -86,16 +86,22 @@ function runHarnessCli(args) {
   });
 }
 
-// Built at runtime so the hook command always uses the current absolute path
+// Built at runtime so the hook command always uses the current absolute path.
+// MUST stay in sync with relay-deamon1/src/harnesses/claude-code/provider.js buildHookBlock().
+// Matcher is '*' (ALL tools) so nothing that needs permission slips through to a manual CLI
+// accept — WebFetch, WebSearch, Task, MCP tools (mcp__*), future/plugin tools all route to the
+// phone. hook.js auto-allows read-only tools (Glob/Grep/…) and approves the rest via
+// permissionDecision:"allow". refreshHookPathIfEnabled() rewrites this on every launch, so an
+// already-enabled harness picks up a widened matcher after an update with no manual re-toggle.
 function buildHookBlock() {
   const wrap = (name) => `node "${path.join(RELAY_ROOT, name)}"`;
   return {
     PreToolUse: [{
-      matcher: 'Bash|Write|Edit|MultiEdit|Read',
+      matcher: '*',
       hooks: [{ type: 'command', command: wrap('hook-wrapper.cjs') }],
     }],
     PostToolUse: [{
-      matcher: 'Bash|Write|Edit|MultiEdit|Read',
+      matcher: '*',
       hooks: [{ type: 'command', command: wrap('postHook-wrapper.cjs') }],
     }],
     Notification: [{
@@ -173,6 +179,22 @@ function refreshHookPathIfEnabled() {
 
 let heartbeatProc  = null;
 let heartbeatAlive = true;   // set false on app quit to stop restart loop
+
+// ── Tray / close-to-tray state ────────────────────────────────────────────────
+// Closing the window HIDES the app to the tray so the heartbeat keeps running and mobile
+// support keeps working. Only an explicit tray "Quit" (or OS shutdown) really exits — and on
+// the way out we disable all harnesses so the CLIs (Claude Code / OpenCode) return to normal
+// while the app is closed. See TRAY_AND_HARNESS_CLEANUP.md.
+let mainWindow = null;
+let tray       = null;
+let isQuitting = false;   // true once a real quit is in progress
+let appReady   = false;   // true once whenReady finished — guards the Squirrel early-quit path
+
+// Tray icon: src/ is excluded from packaging, so the packaged build reads it from resources
+// (added to forge extraResource). Dev reads the source asset.
+const TRAY_ICON = app.isPackaged
+  ? path.join(process.resourcesPath, 'vibeRemote_icon.png')
+  : path.join(__dirname, '..', '..', 'src', 'assets', 'logo', 'vibeRemote_icon.png');
 
 function startHeartbeat() {
   // Only start if the machine is configured (relay .env exists with credentials)
@@ -305,7 +327,7 @@ ipcMain.handle('window:isMaximized', () => {
 });
 
 const createWindow = () => {
-  const mainWindow = new BrowserWindow({
+  mainWindow = new BrowserWindow({
     width: 400,
     height: 780,
     minWidth: 360,
@@ -330,12 +352,61 @@ const createWindow = () => {
     mainWindow.webContents.send('window:maximizeChange', false)
   );
 
+  // Close (X) → hide to tray instead of quitting, so the heartbeat + mobile support keep
+  // running. Only a real quit (isQuitting) lets the window actually close.
+  mainWindow.on('close', (e) => {
+    if (!isQuitting) {
+      e.preventDefault();
+      mainWindow.hide();
+    }
+  });
+
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
   } else {
     mainWindow.loadFile(path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`));
   }
 };
+
+// Show/focus the window (creating it if it was fully closed on macOS).
+function showWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) { createWindow(); return; }
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function createTray() {
+  if (tray) return;
+  let image;
+  try { image = nativeImage.createFromPath(TRAY_ICON); } catch { image = nativeImage.createEmpty(); }
+  if (image.isEmpty()) image = nativeImage.createEmpty();   // Electron tolerates an empty image
+  tray = new Tray(image);
+  tray.setToolTip('Vibe Remote');
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Show Vibe Remote', click: showWindow },
+    { type: 'separator' },
+    { label: 'Quit Vibe Remote', click: () => { gracefulQuit(); } },
+  ]));
+  // Left-click (Windows/Linux) toggles the window.
+  tray.on('click', showWindow);
+}
+
+// The ONE real-exit path: turn off all harness mobile support (so the CLIs behave normally
+// while the app is closed), then quit. Idempotent — guarded by isQuitting.
+async function gracefulQuit() {
+  if (isQuitting) return;
+  isQuitting = true;
+  try {
+    if (existsSync(RELAY_ENV)) {
+      // Cap the wait so a hung CLI can't stall the quit — disable-all is normally ~1s.
+      await Promise.race([
+        runHarnessCli(['disable-all']),
+        new Promise((r) => setTimeout(r, 5000)),
+      ]);
+    }
+  } catch { /* offline / CLI error — quit anyway, better than hanging */ }
+  app.quit();
+}
 
 app.whenReady().then(() => {
   migrateMachineEnv();        // ← move credentials to userData before anything reads them
@@ -346,24 +417,47 @@ app.whenReady().then(() => {
   // harnesses exist and their mobile state. Safe no-op if the machine isn't
   // registered yet (CLI swallows the offline error).
   if (existsSync(RELAY_ENV)) {
-    runHarnessCli(['report']).catch(() => {});
-    // Apply any phone-requested toggles every 15s (optional remote control).
+    // Re-enable any harnesses that were turned off by disable-all when the app last quit, so
+    // mobile support resumes seamlessly. Runs before report so the pushed inventory is correct.
+    // Then `refresh` re-copies the install artifacts (Claude settings.json hooks / OpenCode plugin)
+    // for any still-enabled harness, so a shipped update to those files deploys without a manual
+    // toggle — the OpenCode analogue of refreshHookPathIfEnabled() above.
+    runHarnessCli(['restore'])
+      .catch(() => {})
+      .finally(() => {
+        runHarnessCli(['refresh']).catch(() => {});
+        runHarnessCli(['report']).catch(() => {});
+      });
+    // Apply any phone-requested toggles. Poll tightened 15s → 5s so a mobile-initiated harness
+    // toggle lands in ~5s instead of ~15s (INSTANT_OFFLINE_AND_HARNESS_UPDATES.md §5, Solution C).
+    // A desktop-initiated toggle already reports immediately. A fully event-driven apply (main
+    // subscribing to a `harness_desired` broadcast) is the further optimization noted in the doc.
     harnessDesiredTimer = setInterval(() => {
       runHarnessCli(['apply-desired']).catch(() => {});
-    }, 15000);
+    }, 5000);
   }
 
+  createTray();
   createWindow();
+  appReady = true;
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    if (BrowserWindow.getAllWindows().length === 0) showWindow();
   });
 });
 
-app.on('before-quit', () => {
+// A quit request (tray Quit, Cmd+Q, OS shutdown) must first disable all harnesses. If that
+// cleanup hasn't run yet, cancel THIS quit, do it, then quit for real. Skip the interception
+// during the Squirrel install/uninstall early-quit (before the app is ready) — just let it go.
+app.on('before-quit', (e) => {
+  if (!isQuitting && appReady) {
+    e.preventDefault();
+    gracefulQuit();
+    return;
+  }
   stopHeartbeat();
   if (harnessDesiredTimer) { clearInterval(harnessDesiredTimer); harnessDesiredTimer = null; }
 });
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
-});
+// Do NOT quit when the window closes — it only hides to the tray. The app exits only via
+// gracefulQuit (tray Quit / before-quit), which keeps it alive in the tray otherwise.
+app.on('window-all-closed', () => { /* stay alive in the tray */ });

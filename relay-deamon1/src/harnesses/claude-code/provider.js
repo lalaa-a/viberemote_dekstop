@@ -28,12 +28,19 @@ const wrap = (name) => `node "${path.join(RELAY_ROOT, name)}"`
 
 function buildHookBlock() {
   return {
+    // Match ALL tools ('*') so nothing that needs permission slips through to a manual CLI
+    // accept — WebFetch, WebSearch, Task, MCP tools (mcp__*), and any future/plugin tool now
+    // route to the phone. hook.js auto-allows the read-only tools (Glob/Grep/…) so they don't
+    // spam approvals, and approves the rest via permissionDecision:"allow". AskUserQuestion still
+    // matches '*' and keeps its special handling. See src/filter.js READONLY_TOOLS.
     PreToolUse: [{
-      matcher: 'Bash|Write|Edit|MultiEdit|Read|AskUserQuestion',
+      matcher: '*',
       hooks: [{ type: 'command', command: wrap('hook-wrapper.cjs') }],
     }],
+    // Also '*' so the phone sees results (tool_end) for the newly-intercepted tools. postHook
+    // skips the read-only tools so they don't create orphan feed rows.
     PostToolUse: [{
-      matcher: 'Bash|Write|Edit|MultiEdit|Read',
+      matcher: '*',
       hooks: [{ type: 'command', command: wrap('postHook-wrapper.cjs') }],
     }],
     Notification: [{

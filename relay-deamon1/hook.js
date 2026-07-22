@@ -371,13 +371,13 @@ async function main() {
 
   // Pre-filter
   const { action: filterAction, reason: filterReason } = preFilter(event.tool_name, event.tool_input || {})
-  if (filterAction === 'allow') { process.exit(0); return }
+  if (filterAction === 'allow') { approveExit(); return }
   if (filterAction === 'block') { hardExit(2, filterReason); return }
 
   // Allow-all fast path
   if (existsSync(ALLOW_ALL_FILE)) {
     debugLog('allow-all active — auto-approved')
-    process.exit(0)
+    approveExit()
     return
   }
 
@@ -487,7 +487,7 @@ async function main() {
   logger.info('Decision received', { id: requestId, decision, decidedBy })
 
   if (decision === 'approved') {
-    process.exit(0)
+    approveExit()
   } else {
     hardExit(2, decision === 'timeout'
       ? `No response within ${config.timeoutMs / 1000}s`
@@ -498,6 +498,22 @@ async function main() {
 function hardExit(code, reason) {
   if (code !== 0 && reason) process.stderr.write(JSON.stringify({ decision: reason }) + '\n')
   process.exit(code)
+}
+
+// Approve the tool via the official PreToolUse JSON contract. A bare `exit 0` only means "hook
+// succeeded" — Claude then still runs its NORMAL permission flow, which prompts in the CLI for
+// anything not in settings.json `permissions.allow` (WebFetch, WebSearch, Task, MCP tools, …).
+// Emitting permissionDecision:"allow" makes the hook the sole permission authority, so once the
+// phone approves (or preFilter auto-allows a read-only tool), the tool runs with no manual CLI
+// accept — for EVERY tool, not just the handful pre-listed in permissions.allow.
+function approveExit() {
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName:      'PreToolUse',
+      permissionDecision: 'allow',
+    },
+  }) + '\n')
+  process.exit(0)
 }
 
 // Clean "answer the question" exit for AskUserQuestion. Instead of exit 2 (which Claude

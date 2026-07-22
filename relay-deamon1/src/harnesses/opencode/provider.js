@@ -60,6 +60,10 @@ export default {
     status:  () => strategy.status(),
   },
 
+  // Re-copy the plugin on launch if enabled, so a shipped plugin update deploys without a manual
+  // toggle (mirrors Claude Code's refreshIfEnabled). Called by harness-cli `refresh`.
+  refreshIfEnabled: (ctx) => strategy.refreshIfEnabled(ctx),
+
   // Narrative via SDK SSE. Returns a stop() function.
   narrator: {
     async start() {
