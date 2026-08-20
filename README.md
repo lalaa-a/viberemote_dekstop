@@ -8,18 +8,17 @@
 
 1. [Project Overview](#1-project-overview)
 2. [Tech Stack](#2-tech-stack)
-3. [Directory Structure](#3-directory-structure)
-4. [Architecture](#4-architecture)
-5. [Key Components](#5-key-components)
-6. [Data Flow](#6-data-flow)
-7. [Harness Abstraction Layer](#7-harness-abstraction-layer)
-8. [API Surface](#8-api-surface)
-9. [Database Schema](#9-database-schema)
-10. [Configuration](#10-configuration)
-11. [Build & Deployment](#11-build--deployment)
-12. [Dependencies](#12-dependencies)
-13. [Design Patterns](#13-design-patterns)
-14. [Known Issues](#14-known-issues)
+3. [Architecture](#4-architecture)
+4. [Key Components](#5-key-components)
+5. [Data Flow](#6-data-flow)
+6. [Harness Abstraction Layer](#7-harness-abstraction-layer)
+7. [API Surface](#8-api-surface)
+8. [Database Schema](#9-database-schema)
+9. [Configuration](#10-configuration)
+10. [Build & Deployment](#11-build--deployment)
+11. [Dependencies](#12-dependencies)
+12. [Design Patterns](#13-design-patterns)
+13. [Known Issues](#14-known-issues)
 
 ---
 
@@ -53,107 +52,7 @@
 | Platform | **Windows-only** (Win32 API P/Invoke for keystroke injection) |
 | Runtime | Node.js ESM (daemon), CommonJS (wrappers/relay.cjs) |
 
----
-
-## 3. Directory Structure
-
-```
-vRdeksMultiharness/
-├── src/                              # Electron app source
-│   ├── main.js                       # Main process entry (463 lines)
-│   ├── preload.js                    # Context bridge (IPC surface)
-│   ├── App.jsx                       # Root React component
-│   ├── renderer.jsx                  # React DOM entry
-│   ├── index.css                     # Full application CSS (860 lines)
-│   ├── components/
-│   │   ├── Dashboard.jsx             # Main UI: machine info, QR pairing, harness toggles
-│   │   ├── TitleBar.jsx              # Custom frameless window title bar
-│   │   └── MachineSelector.jsx       # ORPHANED — not imported anywhere
-│   ├── lib/
-│   │   └── supabase.js              # Hardcoded Supabase/API endpoints
-│   └── assets/
-│       ├── fonts/                    # Bitcount, Google Sans Flex
-│       ├── harnessLogos/             # claudecode.svg, opencode.svg
-│       ├── icons/                    # smartphone.svg
-│       └── logo/                     # vibeRemote_icon.ico/.png, logo.svg
-│
-├── relay-deamon1/                    # Standalone Node.js daemon (extraResource)
-│   ├── package.json                  # ESM, own dependencies
-│   ├── hook.js                       # Claude Code PreToolUse hook (540 lines)
-│   ├── postHook.js                   # Claude Code PostToolUse hook
-│   ├── stopHook.js                   # Claude Code Stop hook
-│   ├── notifyHook.js                 # Claude Code Notification hook
-│   ├── hook-wrapper.cjs              # CJS shim → hook.js (Windows ESM compat)
-│   ├── postHook-wrapper.cjs          # CJS shim → postHook.js
-│   ├── stopHook-wrapper.cjs          # CJS shim → stopHook.js
-│   ├── notifyHook-wrapper.cjs        # CJS shim → notifyHook.js
-│   ├── relay.cjs                     # CLI control script (approve/deny/mode)
-│   ├── decide.cjs                    # PC-side approval script
-│   ├── statusLine.cjs                # Claude Code statusLine (token usage)
-│   ├── harness-cli.js                # CLI bridge for Electron main process
-│   ├── scripts/
-│   │   ├── heartbeat.js              # Long-running daemon (1122 lines)
-│   │   └── setup.js                  # Initial setup script
-│   ├── database/
-│   │   ├── schema.sql                # Base Supabase schema
-│   │   ├── seed.sql                  # Seed data
-│   │   └── after.sql                 # Post-migration triggers
-│   └── src/
-│       ├── config.js                 # Loads machine.env, exports typed config
-│       ├── machineEnv.js             # Resolves machine.env location
-│       ├── supabase.js              # Supabase client + all VPS API helpers (287 lines)
-│       ├── registry.js              # Dynamic harness adapter discovery
-│       ├── filter.js                # Pre-filter: allow/block/ask per tool+path
-│       ├── parsers.js               # Parses Claude hook events → display payloads
-│       ├── risk.js                  # Risk assessment engine (regex, 4 levels)
-│       ├── differ.js                # Diff generation (line + word level)
-│       ├── logger.js                # JSON stderr logger
-│       ├── paths.js                 # Runtime/log directory resolution (ESM)
-│       ├── paths.cjs                # Same, CommonJS twin
-│       ├── tty-worker.cjs           # PTY worker thread
-│       ├── harness-sdk/
-│       │   ├── index.js             # Stable SDK surface (re-exports all)
-│       │   ├── env.js               # Non-fatal env loader for adapters
-│       │   ├── transport.js         # Single choke point for VPS HTTP calls
-│       │   ├── schema.js            # Canonical request/event row shapes
-│       │   ├── validate.js          # Provider validation
-│       │   └── strategies/
-│       │       ├── settingsHook.js   # Claude Code (hooks in settings.json)
-│       │       ├── plugin.js         # OpenCode (JS plugin file)
-│       │       ├── ptyProxy.js       # Universal fallback (node-pty wrapper)
-│       │       └── null.js           # Flag-file-only toggle
-│       └── harnesses/
-│           ├── claude-code/
-│           │   ├── provider.js       # Reference adapter
-│           │   └── manifest.json     # capabilities: hook-based
-│           ├── opencode/
-│           │   ├── provider.js       # Plugin-based + SDK
-│           │   ├── manifest.json
-│           │   └── plugin/
-│           │       └── relay.js      # Installed into OpenCode's plugin dir
-│           └── gemini-cli/
-│               ├── provider.js       # PTY-proxy adapter
-│               ├── manifest.json
-│               └── grammar.js        # Prompt detection patterns
-│
-├── forge/                            # Build-time helpers
-│   ├── bundleRelay.cjs               # esbuild: collapses src/ → sealed entries
-│   └── obfuscateRelay.cjs            # javascript-obfuscator: scrambles code
-│
-├── package.json                      # Root package.json (Electron app)
-├── forge.config.js                   # Electron Forge config
-├── electron-builder.yml              # NSIS installer config
-├── vite.main.config.mjs              # Vite — main process
-├── vite.preload.config.mjs           # Vite — preload
-├── vite.renderer.config.mjs          # Vite — React renderer (JSX plugin)
-├── index.html                        # HTML shell
-├── ARCHITECTURE.md                   # 405-line system architecture doc
-└── *.md (12 more)                    # Feature-specific design docs
-```
-
----
-
-## 4. Architecture
+## 3. Architecture
 
 ### High-Level System Diagram
 
@@ -287,9 +186,9 @@ vRdeksMultiharness/
 
 ---
 
-## 5. Key Components
+## 4. Key Components
 
-### 5.1 Electron Main Process (`src/main.js`)
+### 4.1 Electron Main Process (`src/main.js`)
 
 | Responsibility | Detail |
 |---|---|
@@ -301,7 +200,7 @@ vRdeksMultiharness/
 | System Tray | Show/hide, graceful quit (disables all harnesses first) |
 | IPC Surface | 12 handlers for relay config, hook status, harness toggles, window controls, hostname |
 
-### 5.2 React Renderer
+### 4.2 React Renderer
 
 | Component | Purpose |
 |---|---|
@@ -309,7 +208,7 @@ vRdeksMultiharness/
 | `TitleBar.jsx` | Custom window chrome (minimize/maximize/close), tracks maximize state |
 | `Dashboard.jsx` | Three card sections: Machine info, QR pairing, Harness toggles |
 
-### 5.3 Relay Daemon (`relay-deamon1/`)
+### 4.3 Relay Daemon (`relay-deamon1/`)
 
 A **separate Node.js project** with its own `node_modules`, shipped as an Electron `extraResource` outside the asar.
 
@@ -352,7 +251,7 @@ Also performs: OpenCode plugin file/env sync, prompt injection via PowerShell `W
 
 ---
 
-## 6. Data Flow
+## 5. Data Flow
 
 ### Tool Approval Flow (Claude Code)
 
@@ -399,7 +298,7 @@ Desktop: POST /machines/register (unowned, API key)
 
 ---
 
-## 7. Harness Abstraction Layer
+## 6. Harness Abstraction Layer
 
 ### Registry (`registry.js`)
 
@@ -435,7 +334,7 @@ The stable contract that adapters compile against:
 
 ---
 
-## 8. API Surface
+## 7. API Surface
 
 ### Desktop → Server (Machine-Key Auth)
 
@@ -469,7 +368,7 @@ The stable contract that adapters compile against:
 
 ---
 
-## 9. Database Schema
+## 8. Database Schema
 
 ### Tables
 
@@ -520,7 +419,7 @@ The stable contract that adapters compile against:
 
 ---
 
-## 10. Configuration
+## 9. Configuration
 
 ### Environment Variables
 
@@ -544,7 +443,7 @@ The stable contract that adapters compile against:
 
 ---
 
-## 11. Build & Deployment
+## 10. Build & Deployment
 
 ### Build Pipeline
 
@@ -575,7 +474,7 @@ Source Code
 
 ---
 
-## 12. Dependencies
+## 11. Dependencies
 
 ### Electron App (`package.json`)
 
@@ -604,7 +503,7 @@ Source Code
 
 ---
 
-## 13. Design Patterns
+## 12. Design Patterns
 
 ### Multi-Strategy Harness Abstraction
 Each CLI agent has a different interception mechanism. The harness abstraction uses a strategy pattern with a shared SDK contract, making it trivial to add new agents.
@@ -620,5 +519,23 @@ Claude Code hooks communicate approval decisions via exit codes: `0` = allow, `2
 
 ### Progressive Schema Migration
 All migrations are purely additive — they never modify or drop existing columns. This enables zero-downtime schema evolution on a live database.
+
+# Vibe Remote Desktop Application
+
+[![GitHub Release](https://img.shields.io/github/v/release/yourusername/vibe-remote-desktop)](https://github.com/lalaa-a/viberemote_dekstop/releases)
+[![GitHub Downloads](https://img.shields.io/github/downloads/yourusername/vibe-remote-desktop/total)](https://github.com/lalaa-a/viberemote_dekstop/releases)
+
+## Download
+Download the latest desktop application from the [Releases page](https://github.com/yourusername/vibe-remote-desktop/releases).
+
+## Features
+- Remote control
+- Screen sharing
+- File transfer
+
+## Installation
+1. Go to [Releases](https://github.com/lalaa-a/viberemote_dekstop/releases)
+2. Download the appropriate installer for your OS
+3. Run the installer
 
 ---
