@@ -522,11 +522,11 @@ All migrations are purely additive — they never modify or drop existing column
 
 # Vibe Remote Desktop Application
 
-[![GitHub Release](https://img.shields.io/github/v/release/yourusername/vibe-remote-desktop)](https://github.com/lalaa-a/viberemote_dekstop/releases)
-[![GitHub Downloads](https://img.shields.io/github/downloads/yourusername/vibe-remote-desktop/total)](https://github.com/lalaa-a/viberemote_dekstop/releases)
+[![GitHub Release](https://img.shields.io/github/v/release/yourusername/vibe-remote-desktop)](https://github.com/lalaa-a/viberemote_dekstop/releases/tag/v1.0.0)
+[![GitHub Downloads](https://img.shields.io/github/downloads/yourusername/vibe-remote-desktop/total)](https://github.com/lalaa-a/viberemote_dekstop/releases/tag/v1.0.0)
 
 ## Download
-Download the latest desktop application from the [Releases page](https://github.com/yourusername/vibe-remote-desktop/releases).
+Download the latest desktop application from the [Releases page](https://github.com/lalaa-a/viberemote_dekstop/releases/tag/v1.0.0).
 
 ## Features
 - Remote control
