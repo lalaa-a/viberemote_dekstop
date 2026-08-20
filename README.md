@@ -622,13 +622,3 @@ Claude Code hooks communicate approval decisions via exit codes: `0` = allow, `2
 All migrations are purely additive — they never modify or drop existing columns. This enables zero-downtime schema evolution on a live database.
 
 ---
-
-## 14. Known Issues
-
-1. **`MachineSelector.jsx` is orphaned** — not imported anywhere in the codebase
-2. **Windows-only** — keystroke injection uses Win32 API P/Invoke, no cross-platform support
-3. **Hardcoded Supabase endpoints** in `src/lib/supabase.js` — should use environment variables
-4. **No test suite** — no automated testing for either the Electron app or relay daemon
-5. **Stray Android artifact** — `my-release-key.keystore` at root (untracked, unused)
-
----
