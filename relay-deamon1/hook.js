@@ -23,17 +23,53 @@ import { dirname }                                           from 'path'
 import { config }                                            from './src/config.js'
 import { parseEvent }                                        from './src/parsers.js'
 import { preFilter }                                         from './src/filter.js'
-import { uploadRequest, waitForDecision, markDecided,
-         agentPing, postTerminalEvent }                       from './src/supabase.js'
+import { uploadRequest, waitForDecision, waitForAnswer, markDecided,
+         agentPing, postTerminalEvent }                      from './src/supabase.js'
 import { logger }                                            from './src/logger.js'
+import { runtimePath, logPath, ensureDirs }                 from './src/paths.js'
 
 const __dir     = dirname(fileURLToPath(import.meta.url))
 const relayPath = join(__dir, 'relay.cjs').replace(/\\/g, '/')
 
-const PENDING_DIR      = 'C:\\temp\\relay-pending'
-const CURRENT_FILE     = 'C:\\temp\\relay-current.txt'
-const ALLOW_ALL_FILE   = 'C:\\temp\\relay-allow-all.txt'
-const TRANSCRIPT_DIR   = 'C:\\temp\\transcript-paths'
+const PENDING_DIR      = runtimePath('relay-pending')
+const CURRENT_FILE     = runtimePath('relay-current.txt')
+const ALLOW_ALL_FILE   = runtimePath('relay-allow-all.txt')
+const TRANSCRIPT_DIR   = runtimePath('transcript-paths')
+
+// ── Stop (interrupt the turn) ─────────────────────────────────────────────────
+// Claude Code exposes NO external interrupt API, and OS keystroke injection (ESC via
+// WriteConsoleInput) does not reach the CLI when it runs under a ConPTY — which is the
+// normal case in Windows Terminal and VS Code's integrated terminal. The API reports
+// "records written" and the key is simply never consumed.
+//
+// Hooks are the only supported control surface. A hook that prints
+//   { "continue": false, "stopReason": "..." }
+// on stdout and exits 0 halts Claude entirely — this takes precedence over
+// permissionDecision and ends the turn. The heartbeat drops a flag file when the phone
+// requests a stop; we consume it here, on the next tool call. See STOP_AGENT_DESIGN.md.
+const stopFlag = (sessionId) => runtimePath(`relay-stop-${sessionId}.flag`)
+
+function stopRequested(sessionId) {
+  if (!sessionId) return false
+  try {
+    if (!existsSync(stopFlag(sessionId))) return false
+    unlinkSync(stopFlag(sessionId))   // one-shot: never halt the NEXT turn too
+    return true
+  } catch { return false }
+}
+
+// Halt Claude entirely. Exit 0 + this JSON is the documented contract; exit 2 would
+// only block the single tool call and let the model keep going.
+function haltExit(sessionId, reason) {
+  // The turn is over, so drop the busy flag ourselves — the Stop hook may not fire on
+  // a halted turn, and a stale busy flag locks the session out of every future prompt
+  // until its 60s TTL expires.
+  if (sessionId) {
+    try { unlinkSync(runtimePath(`relay-busy-${sessionId}.flag`)) } catch {}
+  }
+  process.stdout.write(JSON.stringify({ continue: false, stopReason: reason }))
+  process.exit(0)
+}
 
 // Record this session's transcript path so heartbeat.js can tail it for narrative output.
 // Touched on every hook fire, so heartbeat can age out sessions where interception is off
@@ -50,8 +86,8 @@ function recordTranscriptPath(sessionId, transcriptPath) {
 
 function debugLog(msg) {
   try {
-    mkdirSync('C:\\temp', { recursive: true })
-    appendFileSync('C:\\temp\\hook-debug.log', `[${new Date().toISOString()}] ${msg}\n`)
+    ensureDirs()
+    appendFileSync(logPath('hook-debug.log'), `[${new Date().toISOString()}] ${msg}\n`)
   } catch {}
 }
 
@@ -101,8 +137,8 @@ Write-Output $result
 function storeClaudePid(sessionId) {
   if (!sessionId) return
   try {
-    mkdirSync('C:\\temp', { recursive: true })
-    const pidFile = `C:\\temp\\relay-pid-${sessionId}.txt`
+    ensureDirs()
+    const pidFile = runtimePath(`relay-pid-${sessionId}.txt`)
 
     if (existsSync(pidFile)) {
       const stored = parseInt(readFileSync(pidFile, 'utf8').trim(), 10)
@@ -172,6 +208,105 @@ function raceDecision(requestId) {
   })
 }
 
+async function handleQuestion(event){
+  const questions = event.tool_input?.questions
+  if(!Array.isArray(questions)||questions.length === 0) {
+    //Nothing to ask - let claude's native tool to handle it.
+    process.exit(0);return
+  }
+
+  //Keep the session row fresh (same as the approval path).
+  try {
+    await agentPing(event.session_id, event.cwd ?? process.cwd(),'AskUserQuestion')
+  } catch {}
+
+  const requestId = randomUUID()
+  try {
+    ensureDirs()
+    writeFileSync(CURRENT_FILE, requestId, 'utf8') //lets relay.cjs answer by index
+    // Persist the options so `relay.cjs answer <n>` can map an index → label locally.
+    writeFileSync(
+      runtimePath('relay-current-question.json'),
+      JSON.stringify({ requestId, questions }),
+      'utf8',
+    )
+  } catch {}
+
+  const row = {
+    id:             requestId, 
+    user_id:        config.userId, 
+    machine_id:     config.machineId,
+    session_id:     event.session_id     || null,
+    harness:        'claude-code',
+    kind:           'question',
+    tool_name:      'AskUserQuestion',
+    display_type:   'question',
+    summary:        questions[0].header ? `${questions[0].header} : ${questions[0].question}` 
+                    : questions[0].question,
+    risk_level:     'low',
+    risk_reason:    'Claude is asking you to choose an option',
+    risk_icon:      '❓',
+    files_affected: [],
+    question:       { questions }, // ← full structured payload
+    status:         'pending', 
+    created_at:     new Date().toISOString(),
+  }
+
+  try {
+    await uploadRequest(row)
+  } catch (err) {
+    debugLog(`question upload failed: ${err.message}`)
+    // Can't reach the server — fall back to the native picker so the user isn't stuck.
+    process.exit(0);return
+  }
+
+  // Mirror the approval path's "tool_start" so mobile shows activity immediately.
+  postTerminalEvent({
+    session_id: event.session_id, event_type: 'tool_start',
+    tool_name: 'AskUserQuestion', summary: row.summary, detail: null, status: null,
+  }).catch(() => {})
+
+  process.stderr.write(
+    `\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `  RELAY  ❓ Claude is asking a question\n` +
+    `  ${row.summary}\n` +
+    `  → Sent to mobile app. Or answer from terminal:\n` +
+    `      ! node ${relayPath} answer 1   (pick option 1)\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`
+  )
+
+  // Block until the user answers (mobile) or the terminal supplies an index.
+  let answer
+  try {
+    answer = await waitForAnswer(requestId)   // { selected_options } | { timeout:true }
+  } catch (err) {
+    debugLog(`waitForAnswer error: ${err.message}`)
+    process.exit(config.failOpen ? 0 : 2); return
+  }
+
+  if (answer?.timeout) {
+    // No answer in time → let the native picker take over rather than guess.
+    hardExit(2, 'No answer within the time limit — please answer in the terminal.')
+    return
+  }
+
+  // Turn the structured selection into a natural-language reason Claude can act on, and
+  // deliver it via a clean deny (exit 0) so there's no "hook error" banner.
+  answerExit(formatAnswerReason(questions, answer.selected_options))
+}
+
+// Build the deny reason that carries the chosen option(s) back to the model.
+function formatAnswerReason(questions, selected_options) {
+  const parts = (selected_options || []).map(ans => {
+    const q = questions[ans.question_index] ?? questions[0]
+    const labels = (ans.selected || []).map(s => `"${s.label}"`).join(', ')
+    const custom = ans.custom_text ? ` (custom answer: "${ans.custom_text}")` : ''
+    return `Q: "${q.question}" → The user selected: ${labels || ans.custom_text}${custom}.`
+  })
+  return `[Answered remotely via mobile] ${parts.join(' ')} ` +
+         `Proceed with this choice and do NOT call AskUserQuestion again for this question.`
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
   debugLog('hook started')
@@ -193,20 +328,56 @@ async function main() {
 
   // Cache the real claude PID so the heartbeat can inject mobile prompts into
   // this exact terminal. Runs the expensive process-tree walk only once per session.
+  // MUST run before the AskUserQuestion branch below: if a session's first hook fire
+  // is a question, returning early here would skip PID registration entirely and the
+  // heartbeat would report the CLI as closed even though it's still open.
   storeClaudePid(event.session_id)
 
   // Record the transcript path so heartbeat can tail it for narrative output
   recordTranscriptPath(event.session_id, event.transcript_path)
 
+  // Mark this session busy (a turn is in flight) so the heartbeat won't inject a queued
+  // mobile prompt mid-turn. The Stop hook clears it. See FAST_PROMPT_DELIVERY_DESIGN.md.
+  if (event.session_id) {
+    try { writeFileSync(runtimePath(`relay-busy-${event.session_id}.flag`), String(Date.now())) } catch {}
+  }
+
+  // Did the phone hit Stop? Check BEFORE the question branch and before any upload, so a
+  // stop wins over anything else this tool call would have done.
+  if (stopRequested(event.session_id)) {
+    debugLog(`stop flag consumed for ${event.session_id} — halting turn`)
+    logger.info('Stopped from mobile', { session: event.session_id })
+    // Emit a `stop` (turn-end) event, not a notification: the Stop hook does NOT fire on a
+    // halted turn, so this is the only turn-end signal the mobile feed gets. The phone keys
+    // its composer off this event (feed broadcast is instant & reliable, unlike the sessions
+    // poll) to unlock the input the moment the turn actually halts. MUST be awaited — haltExit
+    // calls process.exit immediately, which would otherwise kill this POST mid-flight.
+    await postTerminalEvent({
+      session_id: event.session_id,
+      event_type: 'stop',
+      tool_name:  null,
+      summary:    'Stopped from mobile — turn halted.',
+      detail:     null,
+      status:     'stopped',   // mobile StopRow renders this as a "Stopped" tag
+    }).catch(() => {})
+    haltExit(event.session_id, 'Stopped from the VibeRemote mobile app')
+    return
+  }
+
+  if(event.tool_name === "AskUserQuestion") {
+    await handleQuestion(event)
+    return
+  }
+
   // Pre-filter
   const { action: filterAction, reason: filterReason } = preFilter(event.tool_name, event.tool_input || {})
-  if (filterAction === 'allow') { process.exit(0); return }
+  if (filterAction === 'allow') { approveExit(); return }
   if (filterAction === 'block') { hardExit(2, filterReason); return }
 
   // Allow-all fast path
   if (existsSync(ALLOW_ALL_FILE)) {
     debugLog('allow-all active — auto-approved')
-    process.exit(0)
+    approveExit()
     return
   }
 
@@ -238,7 +409,7 @@ async function main() {
 
   // Store current ID so relay.cjs 1/2/3 needs no UUID
   try {
-    mkdirSync('C:\\temp', { recursive: true })
+    ensureDirs()
     writeFileSync(CURRENT_FILE, requestId, 'utf8')
   } catch {}
 
@@ -316,7 +487,7 @@ async function main() {
   logger.info('Decision received', { id: requestId, decision, decidedBy })
 
   if (decision === 'approved') {
-    process.exit(0)
+    approveExit()
   } else {
     hardExit(2, decision === 'timeout'
       ? `No response within ${config.timeoutMs / 1000}s`
@@ -329,10 +500,41 @@ function hardExit(code, reason) {
   process.exit(code)
 }
 
+// Approve the tool via the official PreToolUse JSON contract. A bare `exit 0` only means "hook
+// succeeded" — Claude then still runs its NORMAL permission flow, which prompts in the CLI for
+// anything not in settings.json `permissions.allow` (WebFetch, WebSearch, Task, MCP tools, …).
+// Emitting permissionDecision:"allow" makes the hook the sole permission authority, so once the
+// phone approves (or preFilter auto-allows a read-only tool), the tool runs with no manual CLI
+// accept — for EVERY tool, not just the handful pre-listed in permissions.allow.
+function approveExit() {
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName:      'PreToolUse',
+      permissionDecision: 'allow',
+    },
+  }) + '\n')
+  process.exit(0)
+}
+
+// Clean "answer the question" exit for AskUserQuestion. Instead of exit 2 (which Claude
+// Code renders as a "hook error" banner), we exit 0 and DENY the tool via the official
+// PreToolUse JSON contract — the native picker never renders and the model reads the
+// answer from permissionDecisionReason. See CLAUDE_ASKUSERQUESTION_MECHANISM.md §3.3.
+function answerExit(reason) {
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName:            'PreToolUse',
+      permissionDecision:       'deny',
+      permissionDecisionReason: reason,
+    },
+  }) + '\n')
+  process.exit(0)
+}
+
 main().catch(err => {
   try {
-    mkdirSync('C:\\temp', { recursive: true })
-    appendFileSync('C:\\temp\\hook-debug.log', `[${new Date().toISOString()}] CRASH: ${err.message}\n${err.stack}\n`)
+    ensureDirs()
+    appendFileSync(logPath('hook-debug.log'), `[${new Date().toISOString()}] CRASH: ${err.message}\n${err.stack}\n`)
   } catch {}
   process.exit(0)
 })

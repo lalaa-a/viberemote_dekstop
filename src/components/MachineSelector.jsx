@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import vibeRemoteLogo from '../assets/logo/vibeRemote_logo.svg';
 
 function relativeTime(isoString) {
   if (!isoString) return 'Never seen';
@@ -56,8 +57,8 @@ export default function MachineSelector({ machines, hostname, onReclaim, onNew, 
     <div className="selector-wrap">
       <div className="selector-card">
         <div className="selector-logo">
-          <span className="logo-icon">⬡</span>
-          <span className="logo-text">Vibe Remote</span>
+          <img src={vibeRemoteLogo} className="logo-icon" alt="" />
+          <span className="logo-text">VibeRemote</span>
         </div>
 
         <h2 className="selector-title">Restore an existing machine</h2>

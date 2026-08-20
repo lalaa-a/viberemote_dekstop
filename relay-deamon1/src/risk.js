@@ -85,6 +85,12 @@ export function assessRisk(toolName, toolInput) {
     return assessReadPath(path)
   }
 
+  // Tools now routed to the phone by the '*' hook matcher.
+  if (toolName === 'WebFetch')            return { level: 'medium', reason: 'Fetches a URL over the network', icon: '🌐' }
+  if (toolName === 'WebSearch')           return { level: 'low',    reason: 'Web search', icon: '🔎' }
+  if (toolName === 'Task')                return { level: 'medium', reason: 'Runs a sub-agent', icon: '🤖' }
+  if (toolName?.startsWith('mcp__'))      return { level: 'medium', reason: 'MCP tool call', icon: '🔌' }
+
   return { level: 'medium', reason: 'Unknown tool type', icon: '❓' }
 }
 

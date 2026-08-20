@@ -17,17 +17,19 @@
 
 const path = require('path')
 const fs   = require('fs')
+const os   = require('os')
+const { RUNTIME_DIR } = require('./src/paths.cjs')
 
 // Settings.json — Claude Code's config file (hook is added/removed here)
 const SETTINGS_FILE = path.join(
-  process.env.USERPROFILE || process.env.HOME || 'C:\\Users\\lala',
+  os.homedir(),
   '.claude', 'settings.json'
 )
 
 // The hook block injected when switching to mobile mode
 const HOOK_BLOCK = {
   PreToolUse: [{
-    matcher: 'Bash|Write|Edit|MultiEdit|Read',
+    matcher: 'Bash|Write|Edit|MultiEdit|Read|AskUserQuestion',
     hooks: [{ type: 'command', command: `node "${path.join(__dirname, 'hook-wrapper.cjs')}"` }],
   }],
   PostToolUse: [{
@@ -49,7 +51,7 @@ const HOOK_BLOCK = {
 // The hook is the sole gatekeeper; it exits 0 (allow) or 2 (deny) instead.
 const HOOK_TOOLS_ALLOW = ['Bash(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)', 'Read(*)']
 
-const TEMP_DIR       = 'C:\\temp'
+const TEMP_DIR       = RUNTIME_DIR
 const PENDING_DIR    = path.join(TEMP_DIR, 'relay-pending')
 const CURRENT_FILE   = path.join(TEMP_DIR, 'relay-current.txt')
 const ALLOW_ALL_FILE = path.join(TEMP_DIR, 'relay-allow-all.txt')
@@ -60,13 +62,19 @@ const ALLOW_ALL_FILE = path.join(TEMP_DIR, 'relay-allow-all.txt')
 function machineEnvFile() {
   if (process.env.VIBE_MACHINE_ENV) return process.env.VIBE_MACHINE_ENV
   const os = require('os')
-  const appName = 'my-app'
-  const stable = process.platform === 'win32'
-    ? path.join(os.homedir(), 'AppData', 'Roaming', appName, 'machine.env')
+  // Probe every dir name this app has shipped under (productName drives Electron's
+  // userData path and has changed across releases). Keep in sync with src/machineEnv.js.
+  const appNames = ['VibeRemote', 'Vibe Remote', 'vibe-remote', 'my-app']
+  const root = process.platform === 'win32'
+    ? path.join(os.homedir(), 'AppData', 'Roaming')
     : process.platform === 'darwin'
-      ? path.join(os.homedir(), 'Library', 'Application Support', appName, 'machine.env')
-      : path.join(os.homedir(), '.config', appName, 'machine.env')
-  return fs.existsSync(stable) ? stable : path.join(__dirname, '.env')
+      ? path.join(os.homedir(), 'Library', 'Application Support')
+      : path.join(os.homedir(), '.config')
+  for (const n of appNames) {
+    const p = path.join(root, n, 'machine.env')
+    if (fs.existsSync(p)) return p
+  }
+  return path.join(__dirname, '.env')
 }
 
 function loadEnv() {
@@ -182,6 +190,72 @@ if (cmd === 'reset') {
   try { fs.unlinkSync(ALLOW_ALL_FILE) } catch {}
   console.log('Allow-all cleared — approval prompts will show again')
   process.exit(0)
+}
+
+// ── answer <n> — pick option n for a pending AskUserQuestion (1-based) ─────────
+// Mirrors the approve/deny local-signal path: writes {id}.answer.json which the
+// hook's waitForAnswer() file-poll picks up in ~150ms, AND posts to the server so
+// the mobile feed reflects the answer. Single-question, single-select for the CLI.
+if (cmd === 'answer') {
+  const pick = parseInt(process.argv[3], 10)
+  if (!pick || Number.isNaN(pick) || pick < 1) {
+    console.error('Usage:  ! node relay.cjs answer <n>   (n = option number, 1-based)')
+    process.exit(1)
+  }
+
+  const QFILE = path.join(TEMP_DIR, 'relay-current-question.json')
+  let q
+  try { q = JSON.parse(fs.readFileSync(QFILE, 'utf8')) } catch {
+    console.error('No pending question found.')
+    process.exit(1)
+  }
+
+  const requestId = q.requestId || readCurrentId()
+  const question  = q.questions?.[0]
+  const option    = question?.options?.[pick - 1]
+  if (!requestId || !option) {
+    console.error(`Option ${pick} not found (question has ${question?.options?.length ?? 0} options).`)
+    process.exit(1)
+  }
+
+  const answers = [{
+    question_index: 0,
+    selected: [{ index: pick - 1, label: option.label }],
+  }]
+
+  // Local signal — unblocks the hook immediately.
+  try {
+    fs.mkdirSync(PENDING_DIR, { recursive: true })
+    fs.writeFileSync(
+      path.join(PENDING_DIR, `${requestId}.answer.json`),
+      JSON.stringify({ selected_options: answers }),
+      'utf8',
+    )
+  } catch (e) {
+    console.error('Failed to write answer signal:', e.message)
+    process.exit(1)
+  }
+
+  // Also tell the server so mobile sees the answer.
+  ;(async () => {
+    try {
+      const res = await fetch(`${process.env.API_URL}/relay/answer`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'x-machine-api-key': process.env.MACHINE_API_KEY },
+        body:    JSON.stringify({ requestId, answers }),
+      })
+      if (!res.ok) {
+        const text = await res.text().catch(() => res.status)
+        console.log(`✅ Answered "${option.label}"  (hook signaled; API: ${text})`)
+      } else {
+        console.log(`✅ Answered "${option.label}"`)
+      }
+    } catch (err) {
+      console.log(`✅ Answered "${option.label}"  (hook signaled; API unreachable: ${err.message})`)
+    }
+    process.exit(0)
+  })()
+  return
 }
 
 // ── approve / deny (only meaningful in mobile mode) ───────────────────────────

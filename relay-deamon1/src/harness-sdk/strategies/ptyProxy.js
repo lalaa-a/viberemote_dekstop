@@ -14,7 +14,7 @@
  * harnesses NOT using this strategy (Claude Code, OpenCode) never need it
  * installed. If node-pty is absent, spawn() throws a clear, actionable error.
  */
-import { uploadRequest, pollDecision, postNarrative } from '../transport.js'
+import { uploadRequest, pollDecision, postNarrative, pollStopRequests, ackStopRequests } from '../transport.js'
 import { normalizeRequest, validateRequest, normalizeNarrative } from '../schema.js'
 
 async function loadPty() {
@@ -57,6 +57,30 @@ export function ptyProxyStrategy(cfg) {
       let buf = ''
       let gating = false
 
+      // ── Stop requests (interrupt the current turn) ──────────────────────────
+      // This process (the `vibe run <harness>` wrapper) is the only thing holding
+      // the live PTY handle — heartbeat.js runs in a separate OS process and can't
+      // reach it, so it polls for stop requests itself. Writes ESC only — never
+      // term.kill(), which would end the whole session, not just the current turn.
+      // Skipped while `gating` (an approval prompt is on screen) since ESC there
+      // may dismiss the prompt UI instead of cancelling generation. See
+      // STOP_AGENT_DESIGN.md §3.5.
+      let stopPollTimer = null
+      if (sessionId) {
+        stopPollTimer = setInterval(async () => {
+          try {
+            const pending = await pollStopRequests(sessionId)
+            if (!pending.length) return
+            if (!gating) term.write('\x1b')   // ESC — Gemini CLI's interactive-mode cancel key
+            await ackStopRequests(pending.map(r => r.id))
+            postNarrative(normalizeNarrative({
+              session_id: sessionId, harness: harnessId, event_type: 'notification',
+              summary: 'Stopped from mobile',
+            })).catch(() => {})
+          } catch {}
+        }, 1500)
+      }
+
       term.onData(async (chunk) => {
         process.stdout.write(chunk)                       // user still sees their terminal
         postNarrative(normalizeNarrative({
@@ -95,7 +119,7 @@ export function ptyProxyStrategy(cfg) {
       return {
         inject: (text) => term.write(text.endsWith('\r') ? text : text + '\r'),
         write:  (data) => term.write(data),
-        stop:   () => { try { term.kill() } catch {} },
+        stop:   () => { try { term.kill() } catch {}; if (stopPollTimer) clearInterval(stopPollTimer) },
         pid:    term.pid,
       }
     },

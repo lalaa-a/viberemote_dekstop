@@ -16,9 +16,10 @@ import os from 'node:os'
 import path from 'node:path'
 import manifest from './manifest.json' with { type: 'json' }
 import { settingsHookStrategy, commandExists, getVersion, RELAY_ROOT } from '../../harness-sdk/index.js'
+import { runtimePath } from '../../paths.js'
 
 const SETTINGS_FILE  = path.join(os.homedir(), '.claude', 'settings.json')
-const ALLOW_ALL_FILE = 'C:\\temp\\relay-allow-all.txt'
+const ALLOW_ALL_FILE = runtimePath('relay-allow-all.txt')
 
 // Identical to the legacy main.js buildHookBlock() — same matchers, same wrapper
 // filenames, resolved against the real relay-deamon1 root in dev and packaged.
@@ -27,12 +28,19 @@ const wrap = (name) => `node "${path.join(RELAY_ROOT, name)}"`
 
 function buildHookBlock() {
   return {
+    // Match ALL tools ('*') so nothing that needs permission slips through to a manual CLI
+    // accept — WebFetch, WebSearch, Task, MCP tools (mcp__*), and any future/plugin tool now
+    // route to the phone. hook.js auto-allows the read-only tools (Glob/Grep/…) so they don't
+    // spam approvals, and approves the rest via permissionDecision:"allow". AskUserQuestion still
+    // matches '*' and keeps its special handling. See src/filter.js READONLY_TOOLS.
     PreToolUse: [{
-      matcher: 'Bash|Write|Edit|MultiEdit|Read',
+      matcher: '*',
       hooks: [{ type: 'command', command: wrap('hook-wrapper.cjs') }],
     }],
+    // Also '*' so the phone sees results (tool_end) for the newly-intercepted tools. postHook
+    // skips the read-only tools so they don't create orphan feed rows.
     PostToolUse: [{
-      matcher: 'Bash|Write|Edit|MultiEdit|Read',
+      matcher: '*',
       hooks: [{ type: 'command', command: wrap('postHook-wrapper.cjs') }],
     }],
     Notification: [{
@@ -49,6 +57,10 @@ const strategy = settingsHookStrategy({
   buildHookBlock,
   allowList:     HOOK_TOOLS_ALLOW,
   allowAllFile:  ALLOW_ALL_FILE,
+  // Live token-usage: register our statusLine so it pokes the heartbeat at Claude's refresh
+  // cadence (see LIVE_TOKEN_STATUSLINE_DESIGN.md). Backs up / restores any user statusLine.
+  statusLineCommand:    wrap('statusLine.cjs'),
+  statusLineBackupFile: runtimePath('statusline-backup.json'),
 })
 
 export default {

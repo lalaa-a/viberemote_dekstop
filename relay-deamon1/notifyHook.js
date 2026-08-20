@@ -10,8 +10,9 @@
 import { postTerminalEvent } from './src/supabase.js'
 import { mkdirSync, writeFileSync } from 'fs'
 import { join } from 'path'
+import { runtimePath } from './src/paths.js'
 
-const TRANSCRIPT_DIR = 'C:\\temp\\transcript-paths'
+const TRANSCRIPT_DIR = runtimePath('transcript-paths')
 function recordTranscriptPath(sessionId, transcriptPath) {
   if (!sessionId || !transcriptPath) return
   try {

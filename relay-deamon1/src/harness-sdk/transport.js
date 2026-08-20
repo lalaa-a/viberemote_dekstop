@@ -94,3 +94,18 @@ export async function reportHarness(harnesses) {
 export async function getDesired() {
   return (await apiGet('/harness/desired')) || []
 }
+
+// ── Stop requests (interrupt an in-flight turn) ───────────────────────────────
+// Used by strategies that run outside heartbeat.js's process (e.g. the PTY-proxy
+// wrapper for Gemini CLI) and need to poll for a stop themselves. See
+// STOP_AGENT_DESIGN.md. Pass a sessionId to scope the poll to a single session.
+export async function pollStopRequests(sessionId) {
+  const qs = sessionId ? `?session=${encodeURIComponent(sessionId)}` : ''
+  const data = await apiGet(`/relay/stop-requests${qs}`)
+  return data?.requests ?? []
+}
+
+export async function ackStopRequests(ids) {
+  if (!ids?.length) return
+  return apiPost('/relay/stop-ack', { ids })
+}

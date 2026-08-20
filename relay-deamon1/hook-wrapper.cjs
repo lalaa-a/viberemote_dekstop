@@ -10,8 +10,9 @@
 const path = require('path')
 const fs   = require('fs')
 const url  = require('url')
+const { logPath, ensureDirs } = require('./src/paths.cjs')
 
-const LOG_FILE  = 'C:\\temp\\hook-debug.log'
+const LOG_FILE  = logPath('hook-debug.log')
 const HOOK_FILE = path.join(__dirname, 'hook.js')
 
 // On Windows, dynamic import() requires a file:// URL — a bare path like
@@ -20,7 +21,7 @@ const HOOK_URL  = url.pathToFileURL(HOOK_FILE).href
 
 function debugLog(msg) {
   try {
-    fs.mkdirSync('C:\\temp', { recursive: true })
+    ensureDirs()
     fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`)
   } catch {}
 }

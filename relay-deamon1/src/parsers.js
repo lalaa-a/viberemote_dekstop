@@ -14,15 +14,33 @@ export function parseEvent(event) {
     case 'Edit':      return { ...base, ...parseEdit(tool_input) }
     case 'MultiEdit': return { ...base, ...parseMultiEdit(tool_input) }
     case 'Read':      return { ...base, ...parseRead(tool_input) }
+    // Every other tool now reaches the phone (the hook matches '*'): WebFetch, WebSearch, Task,
+    // MCP tools (mcp__server__tool), plugin tools, future tools. We keep display_type 'unknown'
+    // (the mobile app's existing fallback card) but give it a clean, human summary so the
+    // approval reads well instead of "X — unrecognised tool".
     default: return {
       ...base,
       display_type:   'unknown',
-      summary:        `${tool_name} — unrecognised tool`,
+      summary:        genericSummary(tool_name, tool_input),
       files_affected: [],
       diff:           null,
       raw_input:      tool_input,
     }
   }
+}
+
+// Human-readable one-liner for any tool without a dedicated parser.
+function genericSummary(toolName, input = {}) {
+  if (toolName === 'WebFetch')  return `Fetch ${input.url || ''}`.trim()
+  if (toolName === 'WebSearch') return `Search "${input.query || ''}"`
+  if (toolName === 'Task') {
+    const type = input.subagent_type || 'agent'
+    return `Task (${type})${input.description ? `: ${input.description}` : ''}`
+  }
+  // MCP tools are named mcp__<server>__<tool>
+  const mcp = /^mcp__(.+?)__(.+)$/.exec(toolName || '')
+  if (mcp) return `${mcp[1]} → ${mcp[2].replace(/_/g, ' ')}`
+  return toolName || 'Tool'
 }
 
 // ─── Bash ─────────────────────────────────────────────────────────────────────
