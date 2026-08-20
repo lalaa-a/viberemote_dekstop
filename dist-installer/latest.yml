@@ -1,8 +1,8 @@
-version: 1.6.3
+version: 1.6.5-re
 files:
-  - url: VibeRemote-Setup-1.6.3.exe
-    sha512: VtDpOKet3Rv6oBYwZtOjhkUwbj9Gon/9rEDrhAnLaW5Ar6j71jJQ6HWmUxac+fTaevgpoL2jifmr2wKhpw9Thg==
-    size: 103417278
-path: VibeRemote-Setup-1.6.3.exe
-sha512: VtDpOKet3Rv6oBYwZtOjhkUwbj9Gon/9rEDrhAnLaW5Ar6j71jJQ6HWmUxac+fTaevgpoL2jifmr2wKhpw9Thg==
-releaseDate: '2026-07-22T09:29:23.862Z'
+  - url: VibeRemote-Setup-1.6.5-re.exe
+    sha512: t0U6B4oF8r1FIOH/Qu4bwXGkT3+mx6yyZkPKQY7a8my5EJlHq1lX4egaXj5NN3UEa90VBQWLuOpALrxYxLzz+g==
+    size: 103421580
+path: VibeRemote-Setup-1.6.5-re.exe
+sha512: t0U6B4oF8r1FIOH/Qu4bwXGkT3+mx6yyZkPKQY7a8my5EJlHq1lX4egaXj5NN3UEa90VBQWLuOpALrxYxLzz+g==
+releaseDate: '2026-07-23T18:10:48.611Z'

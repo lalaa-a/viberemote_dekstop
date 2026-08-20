@@ -3,6 +3,14 @@ import { QRCodeSVG } from 'qrcode.react';
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY, API_URL } from '../lib/supabase.js';
 import vibeRemoteLogo from '../assets/logo/vibeRemote_logo.svg';
 import phoneIcon from '../assets/icons/smartphone.svg';
+import claudeCodeLogo from '../assets/harnessLogos/claudecode.svg';
+import openCodeLogo from '../assets/harnessLogos/opencode.svg';
+
+// Real brand logos; harnesses without a logo file fall back to the inline glyph below.
+const HARNESS_LOGO = {
+  'claude-code': claudeCodeLogo,
+  'opencode':    openCodeLogo,
+};
 
 async function sha256hex(text) {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
@@ -24,23 +32,11 @@ function PhoneGlyph() {
   return <img src={phoneIcon} width="26" height="26" style={{ filter: 'brightness(0) invert(1)' }} alt="" />;
 }
 
-// Per-harness glyph, drawn dark on the green bubble.
+// Per-harness glyph. Real brand logos for known harnesses; a dark inline glyph otherwise.
 function HarnessGlyph({ harness }) {
+  const logo = HARNESS_LOGO[harness];
+  if (logo) return <img src={logo} width="22" height="22" alt="" />;
   const p = { width: 20, height: 20, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round' };
-  if (harness === 'claude-code') return (
-    <svg {...p}>
-      <rect x="4" y="7" width="16" height="11" rx="3" />
-      <path d="M12 4v3" />
-      <circle cx="9.5" cy="12.5" r="1.1" fill="currentColor" stroke="none" />
-      <circle cx="14.5" cy="12.5" r="1.1" fill="currentColor" stroke="none" />
-    </svg>
-  );
-  if (harness === 'opencode') return (
-    <svg {...p}>
-      <rect x="5" y="5" width="14" height="14" rx="3" />
-      <rect x="9.5" y="9.5" width="5" height="5" rx="1" fill="currentColor" stroke="none" />
-    </svg>
-  );
   if (harness === 'gemini-cli') return (
     <svg {...p}><path d="M9 7l5 5-5 5" /></svg>
   );

@@ -1,7 +1,7 @@
 {
   "name": "vibe-remote",
   "productName": "VibeRemote",
-  "version": "1.6.3",
+  "version": "1.6.5",
   "description": "testing version",
   "main": ".vite/build/main.js",
   "private": true,

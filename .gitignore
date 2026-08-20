@@ -59,7 +59,28 @@ typings/
 
 # dotenv environment variables file
 .env
-.env.test
+.env.*
+!.env.example
+
+# Relay daemon environment
+relay-deamon1/.env
+relay-deamon1/node_modules/
+
+# Built installers (large binaries)
+dist-installer/
+
+# Stray Android artifact
+*.keystore
+!debug.keystore
+
+# Electron app packaging output
+out/
+
+# Supabase local exports
+supabase/
+
+# Database schema dumps
+schema.sql
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache
@@ -88,8 +109,6 @@ typings/
 # Vite
 .vite/
 
-# Electron-Forge
-out/
-
-#Dist-installer
-.dist-installer/
+# Lock files (keep package-lock, ignore others)
+yarn.lock
+pnpm-lock.yaml

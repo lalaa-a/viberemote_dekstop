@@ -154,14 +154,21 @@ const _pingedSessions = new Set()
 
 async function agentPing(e, sessionID, cwd) {
   if (!sessionID || _pingedSessions.has(sessionID)) return
-  _pingedSessions.add(sessionID)
   try {
-    await fetch(`${e.apiUrl}/relay/agent-ping`, {
+    const res = await fetch(`${e.apiUrl}/relay/agent-ping`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-machine-api-key': e.machineApiKey },
       body: JSON.stringify({ sessionId: sessionID, cwd: cwd ?? null, harness: 'opencode' }),
     })
-  } catch { /* non-fatal — session just won't appear in the list */ }
+    // Only cache as "pinged" once the agents row was actually created. Previously we marked it
+    // BEFORE the fetch, so a single failed ping meant the session was never created and never
+    // retried. That surfaced when the permission handler began pinging early (before any
+    // narrative). Leaving it uncached on failure lets the next event retry.
+    if (res.ok) { _pingedSessions.add(sessionID); dbg(`agent-ping ok ${sessionID}`) }
+    else dbg(`agent-ping ${sessionID} → HTTP ${res.status} (will retry)`)
+  } catch (err) {
+    dbg(`agent-ping failed ${sessionID}: ${err.message} (will retry)`)
+  }
 }
 
 // ── Debug log (helps diagnose why narrative may not appear) ───────────────────
@@ -492,7 +499,8 @@ export const VibeRelay = async ({ project, directory, serverUrl, client } = {}) 
       if (!e.apiUrl) return
 
       recordPid(input.sessionID)
-      agentPing(e, input.sessionID, directory ?? null)
+      // Await so the session is registered before we block on the approval wait below.
+      await agentPing(e, input.sessionID, directory ?? null)
 
       const args = (output && output.args) || input.args || {}
       const meta = summarize(input.tool, args)
@@ -580,7 +588,9 @@ export const VibeRelay = async ({ project, directory, serverUrl, client } = {}) 
         }
 
         recordPid(sessionID)
-        agentPing(e, sessionID, directory ?? null)
+        // Await so the session (agents row) is registered BEFORE we block on the approval wait —
+        // otherwise the phone gets a notification for a session that isn't in its list yet.
+        await agentPing(e, sessionID, directory ?? null)
 
         const summary = perm.title || (permTool ? `Permission: ${permTool}` : 'Permission request')
         postTerminalEvent(e, { session_id: sessionID, event_type: 'tool_start', tool_name: permTool || 'permission', summary })
