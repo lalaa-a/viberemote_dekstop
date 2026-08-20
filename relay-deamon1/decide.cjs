@@ -10,13 +10,14 @@
  *
  * This writes a local signal file (picked up by the hook in ~150 ms) AND
  * updates Supabase so the mobile app sees the decision immediately.
- */
+*/
 
 const { createClient } = require('@supabase/supabase-js')
 const path = require('path')
 const fs   = require('fs')
+const { runtimePath } = require('./src/paths.cjs')
 
-const PENDING_DIR = 'C:\\temp\\relay-pending'
+const PENDING_DIR = runtimePath('relay-pending')
 
 // ── Load .env ─────────────────────────────────────────────────────────────────
 function loadEnv() {

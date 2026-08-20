@@ -6,14 +6,15 @@
 const path = require('path')
 const fs   = require('fs')
 const url  = require('url')
+const { logPath, ensureDirs } = require('./src/paths.cjs')
 
 const HOOK_FILE = path.join(__dirname, 'postHook.js')
 const HOOK_URL  = url.pathToFileURL(HOOK_FILE).href
 
 function debugLog(msg) {
   try {
-    fs.mkdirSync('C:\\temp', { recursive: true })
-    fs.appendFileSync('C:\\temp\\hook-debug.log', `[${new Date().toISOString()}] [postHook] ${msg}\n`)
+    ensureDirs()
+    fs.appendFileSync(logPath('hook-debug.log'), `[${new Date().toISOString()}] [postHook] ${msg}\n`)
   } catch {}
 }
 

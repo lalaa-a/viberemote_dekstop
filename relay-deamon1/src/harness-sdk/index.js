@@ -7,6 +7,7 @@ export { loadEnv, machineCtx, isRegistered, RELAY_ROOT } from './env.js'
 export {
   commandExists, getVersion,
   uploadRequest, pollDecision, postNarrative, reportHarness, getDesired,
+  pollStopRequests, ackStopRequests,
 } from './transport.js'
 export {
   normalizeRequest, validateRequest, normalizeNarrative,

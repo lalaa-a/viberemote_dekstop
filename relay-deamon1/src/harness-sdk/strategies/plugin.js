@@ -49,5 +49,12 @@ export function pluginStrategy(cfg) {
     async status() {
       return { enabled: existsSync(flagFile) && existsSync(pluginDst) }
     },
+
+    // Re-copy the plugin + env if mobile is currently on, so a shipped plugin update lands on the
+    // next app launch without the user toggling off/on. Analogous to the Claude settings-hook
+    // refresh. No-op when mobile is off.
+    async refreshIfEnabled(ctx) {
+      if (existsSync(flagFile) && existsSync(pluginDst)) { await this.enable(ctx) }
+    },
   }
 }

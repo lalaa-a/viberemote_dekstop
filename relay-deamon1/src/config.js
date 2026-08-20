@@ -39,7 +39,12 @@ export const config = {
   machineId:      required('MACHINE_ID'),
   machineLabel:   process.env.MACHINE_LABEL  || 'Unknown Machine',
   machineApiKey:  required('MACHINE_API_KEY'),
-  userId:         required('USER_ID'),
+  // USER_ID is no longer set at registration — the machine is unowned until a
+  // phone pairs it (mobile-first auth). Defaults to '' so the daemon runs unpaired.
+  userId:         process.env.USER_ID || '',
+  // Session token issued by the server on pairing; delivered to machine.env by the
+  // desktop UI. Reserved for future per-request session verification.
+  machineSessionToken: process.env.MACHINE_SESSION_TOKEN || '',
   timeoutMs:      (parseInt(process.env.TIMEOUT_SECONDS) || 300) * 1000,
   failOpen:       process.env.FAIL_OPEN !== 'false',
   alwaysAllow:    list('ALWAYS_ALLOW'),

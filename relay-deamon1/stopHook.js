@@ -10,8 +10,9 @@
 import { postTerminalEvent } from './src/supabase.js'
 import { mkdirSync, writeFileSync, unlinkSync } from 'fs'
 import { join } from 'path'
+import { runtimePath } from './src/paths.js'
 
-const TRANSCRIPT_DIR = 'C:\\temp\\transcript-paths'
+const TRANSCRIPT_DIR = runtimePath('transcript-paths')
 
 function readStdin(ms) {
   return new Promise((resolve) => {
@@ -49,9 +50,23 @@ async function main() {
     status:     'success',
   }).catch(() => {})
 
-  // Session ended — drop the transcript mapping so heartbeat stops tailing it
+  // Do NOT delete the transcript mapping here. Stop fires at the end of EVERY turn
+  // (not when the CLI closes), so deleting it removed the mapping the heartbeat's 3s
+  // transcript tailer needs — short turns deleted their mapping before the tailer
+  // read the new reasoning, so narrative never reached mobile. Aging of genuinely
+  // dead sessions is handled by the heartbeat's 5-min STALE_MAPPING_MS gate; a
+  // closed CLI is tracked separately via the relay-pid liveness probe.
+
+  // Turn ended → clear the busy flag and drop a ready flag so the heartbeat injects any
+  // prompt queued for this now-idle session within ~1s. See FAST_PROMPT_DELIVERY_DESIGN.md.
   if (event.session_id) {
-    try { unlinkSync(join(TRANSCRIPT_DIR, `${event.session_id}.path`)) } catch {}
+    try { unlinkSync(runtimePath(`relay-busy-${event.session_id}.flag`)) } catch {}
+    try { writeFileSync(runtimePath(`relay-ready-${event.session_id}.flag`), '1') } catch {}
+
+    // Drop any unconsumed stop flag. The turn is over, so a stop that raced the finish
+    // line has nothing left to halt — and if it survived, the FIRST tool call of the
+    // user's next prompt would consume it and kill that prompt on arrival.
+    try { unlinkSync(runtimePath(`relay-stop-${event.session_id}.flag`)) } catch {}
   }
 
   process.exit(0)
