@@ -632,5 +632,3 @@ All migrations are purely additive — they never modify or drop existing column
 5. **Stray Android artifact** — `my-release-key.keystore` at root (untracked, unused)
 
 ---
-
-*Generated: 2026-08-20*
